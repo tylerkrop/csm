@@ -1,0 +1,17 @@
+[package]
+name = "copilot-session-manager"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "csm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
