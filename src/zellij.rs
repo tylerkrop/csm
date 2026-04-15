@@ -61,6 +61,19 @@ pub fn cleanup(name: &str) {
         .output();
 }
 
+/// Kill a running zellij session and wait for it to be fully removed.
+/// Polls until the session disappears from the session list (100ms intervals, 5s timeout).
+pub fn stop_and_cleanup(name: &str) {
+    stop(name);
+    for _ in 0..50 {
+        cleanup(name);
+        if !session_exists(name) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn session_exists(name: &str) -> bool {
     Command::new("zellij")
         .args(["list-sessions", "-s"])
