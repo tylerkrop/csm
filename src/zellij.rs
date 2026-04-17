@@ -11,20 +11,13 @@ impl State {
             .args(["list-sessions", "-n"])
             .output()
             .ok()
-            .map(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter_map(|line| {
-                        let name = line.split_whitespace().next()?;
-                        if name.is_empty() {
-                            return None;
-                        }
-                        let running = !line.contains("EXITED");
-                        Some((name.to_string(), running))
-                    })
-                    .collect()
-            })
+            .map(|out| parse_list_sessions(&String::from_utf8_lossy(&out.stdout)))
             .unwrap_or_default();
+        Self { sessions }
+    }
+
+    #[cfg(test)]
+    pub fn from_sessions(sessions: Vec<(String, bool)>) -> Self {
         Self { sessions }
     }
 
@@ -114,4 +107,69 @@ pub fn spawn_command_injector(session_name: String, command: String) -> tokio::t
             .args(["-s", &session_name, "action", "write", "10"])
             .output();
     })
+}
+
+/// Parse the output of `zellij list-sessions -n`. Each non-empty line begins
+/// with a session name; the line is treated as "running" unless it contains
+/// the literal `EXITED` marker. Exposed as a free function so it can be unit
+/// tested without invoking the zellij binary.
+fn parse_list_sessions(stdout: &str) -> Vec<(String, bool)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?;
+            if name.is_empty() {
+                return None;
+            }
+            let running = !line.contains("EXITED");
+            Some((name.to_string(), running))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_empty_output() {
+        assert!(parse_list_sessions("").is_empty());
+        assert!(parse_list_sessions("\n\n").is_empty());
+    }
+
+    #[test]
+    fn parse_running_and_exited() {
+        let out = "\
+abc12345 [Created 2m ago]\n\
+def67890 [Created 5m ago] (EXITED - attach to resume)\n\
+fed09876 [Created 1h ago]\n";
+        let parsed = parse_list_sessions(out);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0], ("abc12345".to_string(), true));
+        assert_eq!(parsed[1], ("def67890".to_string(), false));
+        assert_eq!(parsed[2], ("fed09876".to_string(), true));
+    }
+
+    #[test]
+    fn parse_skips_blank_lines() {
+        let out = "abc\n\n   \ndef\n";
+        let parsed = parse_list_sessions(out);
+        assert_eq!(parsed, vec![("abc".to_string(), true), ("def".to_string(), true)]);
+    }
+
+    #[test]
+    fn state_helpers() {
+        let s = State::from_sessions(vec![
+            ("a".to_string(), true),
+            ("b".to_string(), false),
+        ]);
+        assert!(s.is_running("a"));
+        assert!(!s.is_running("b"));
+        assert!(s.exists("a"));
+        assert!(s.exists("b"));
+        assert!(!s.exists("c"));
+        assert_eq!(s.display_status("a"), "running");
+        assert_eq!(s.display_status("b"), "exited");
+        assert_eq!(s.display_status("c"), "stopped");
+    }
 }

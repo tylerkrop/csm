@@ -114,3 +114,131 @@ pub fn status_rank(s: &str) -> u8 {
         _ => 4,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn uuid_hex_strips_hyphens() {
+        assert_eq!(
+            uuid_hex("12345678-1234-1234-1234-123456789abc"),
+            "1234567812341234123412345678 9abc".replace(' ', "")
+        );
+        assert_eq!(uuid_hex(""), "");
+        assert_eq!(uuid_hex("nodashes"), "nodashes");
+    }
+
+    #[test]
+    fn short_uuid_returns_8_hex_chars() {
+        assert_eq!(short_uuid("abcdef01-2345-6789-abcd-ef0123456789"), "abcdef01");
+        // Shorter input shouldn't panic
+        assert_eq!(short_uuid("abc"), "abc");
+        assert_eq!(short_uuid(""), "");
+    }
+
+    #[test]
+    fn shortest_unique_prefixes_basic() {
+        let ids: Vec<String> = ["abcd", "abef", "wxyz"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(shortest_unique_prefixes(&ids), vec![3, 3, 1]);
+    }
+
+    #[test]
+    fn shortest_unique_prefixes_single() {
+        let ids = vec!["abcd".to_string()];
+        assert_eq!(shortest_unique_prefixes(&ids), vec![1]);
+    }
+
+    #[test]
+    fn shortest_unique_prefixes_empty_list() {
+        let ids: Vec<String> = vec![];
+        assert!(shortest_unique_prefixes(&ids).is_empty());
+    }
+
+    #[test]
+    fn shortest_unique_prefixes_identical_returns_full_len() {
+        let ids = vec!["abcd".to_string(), "abcd".to_string()];
+        // No prefix is unique; falls back to full length.
+        assert_eq!(shortest_unique_prefixes(&ids), vec![4, 4]);
+    }
+
+    #[test]
+    fn shortest_unique_prefixes_one_is_prefix_of_other() {
+        let ids = vec!["abc".to_string(), "abcd".to_string()];
+        // "abc" is never unique on its own (the other starts with it),
+        // so it falls back to full length. "abcd" is unique at len 4.
+        assert_eq!(shortest_unique_prefixes(&ids), vec![3, 4]);
+    }
+
+    #[test]
+    fn relative_time_buckets() {
+        let fmt = "%Y-%m-%d %H:%M:%S";
+        let now = Utc::now().naive_utc();
+        let cases = [
+            (Duration::seconds(10), "now"),
+            (Duration::seconds(120), "2m"),
+            (Duration::hours(3), "3h"),
+            (Duration::days(2), "2d"),
+            (Duration::days(14), "2w"),
+            (Duration::days(60), "2mo"),
+        ];
+        for (delta, expected) in cases {
+            let ts = (now - delta).format(fmt).to_string();
+            assert_eq!(relative_time(&ts), expected, "delta={delta:?}");
+        }
+    }
+
+    #[test]
+    fn relative_time_invalid_returns_input() {
+        assert_eq!(relative_time("not a timestamp"), "not a timestamp");
+    }
+
+    #[test]
+    fn status_rank_ordering() {
+        assert!(status_rank("running") < status_rank("exited"));
+        assert!(status_rank("exited") < status_rank("stopped"));
+        assert!(status_rank("stopped") < status_rank("removed"));
+        assert!(status_rank("removed") < status_rank("anything else"));
+    }
+
+    #[test]
+    fn format_shortcode_no_color_truncates_to_8() {
+        let hex = "abcdef0123456789";
+        let s = format_shortcode(hex, 3, false);
+        assert_eq!(s, "abcdef01");
+    }
+
+    #[test]
+    fn format_shortcode_clamps_unique_len() {
+        let hex = "abcdef0123456789";
+        // unique_len greater than display window should not panic.
+        let s = format_shortcode(hex, 99, false);
+        assert_eq!(s, "abcdef01");
+    }
+
+    #[test]
+    fn format_shortcode_color_contains_ansi() {
+        let s = format_shortcode("abcdef0123", 3, true);
+        assert!(s.contains("\x1b["));
+        assert!(s.contains("abc"));
+        assert!(s.contains("def01"));
+    }
+
+    #[test]
+    fn format_session_line_no_color_layout() {
+        let line = format_session_line(
+            "abcd1234",
+            "myname",
+            "myrepo",
+            "tk/branch",
+            "running",
+            "1970-01-01 00:00:00",
+            false,
+        );
+        assert!(line.starts_with("abcd1234 myname myrepo tk/branch running ["));
+        assert!(line.ends_with(']'));
+        // No ANSI escapes when color is off.
+        assert!(!line.contains("\x1b["));
+    }
+}

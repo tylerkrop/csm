@@ -121,3 +121,30 @@ pub fn current_branch(worktree_path: &str) -> Option<String> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_name_basic() {
+        assert_eq!(repo_name("/tmp/foo"), "foo");
+        assert_eq!(repo_name("foo"), "foo");
+        assert_eq!(repo_name("/a/b/c/my-repo"), "my-repo");
+    }
+
+    #[test]
+    fn repo_name_unsafe_components_fall_back() {
+        // Path::file_name returns None for these, so we fall back to "unknown".
+        assert_eq!(repo_name(""), "unknown");
+        assert_eq!(repo_name("/"), "unknown");
+        assert_eq!(repo_name("."), "unknown");
+        assert_eq!(repo_name(".."), "unknown");
+    }
+
+    #[test]
+    fn repo_name_trailing_slash() {
+        // Path::file_name strips trailing slash and returns the last component.
+        assert_eq!(repo_name("/tmp/foo/"), "foo");
+    }
+}

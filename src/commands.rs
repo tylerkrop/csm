@@ -500,3 +500,52 @@ pub async fn rename(old: &str, new_name: &str) -> Result<()> {
     println!("Renamed session '{old_name}' → '{new_name}'{running}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_name_accepts_valid() {
+        assert!(validate_name("abc").is_ok());
+        assert!(validate_name("abc-123").is_ok());
+        assert!(validate_name("abc_123").is_ok());
+        assert!(validate_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_empty() {
+        assert!(validate_name("").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_special_chars() {
+        for bad in ["a b", "a/b", "a.b", "a\\b", "a;b", "a$b"] {
+            assert!(validate_name(bad).is_err(), "expected '{bad}' to be rejected");
+        }
+    }
+
+    #[test]
+    fn copilot_command_accepts_real_uuid() {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let cmd = copilot_command(&uuid).expect("valid uuid");
+        assert!(cmd.contains(&uuid));
+        assert!(cmd.starts_with("copilot --yolo --no-remote --autopilot --resume="));
+    }
+
+    #[test]
+    fn copilot_command_rejects_invalid() {
+        // Strings that pass the *old* hex-only check but are not real UUIDs.
+        // This guards the security fix from regressing.
+        for bad in [
+            "",
+            "----",
+            "deadbeef",
+            "; rm -rf / #",
+            "12345678-1234-1234-1234-12345678", // too short
+            "not-a-uuid-at-all-really-no",
+        ] {
+            assert!(copilot_command(bad).is_err(), "expected '{bad}' to be rejected");
+        }
+    }
+}
