@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Schema};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Schema, Statement};
 
 use crate::entity::session;
 
@@ -18,6 +18,16 @@ pub async fn connect() -> Result<DatabaseConnection> {
         .context("Failed to connect to database")?;
 
     let backend = db.get_database_backend();
+
+    // Enable WAL mode for better concurrent reader/writer behavior, and set a
+    // busy timeout so concurrent CSM invocations wait briefly for the lock
+    // instead of immediately erroring with SQLITE_BUSY.
+    for pragma in ["PRAGMA journal_mode=WAL;", "PRAGMA busy_timeout=5000;"] {
+        db.execute(Statement::from_string(backend, pragma.to_string()))
+            .await
+            .with_context(|| format!("Failed to apply pragma: {pragma}"))?;
+    }
+
     let schema = Schema::new(backend);
     let mut stmt = schema.create_table_from_entity(session::Entity);
     stmt.if_not_exists();

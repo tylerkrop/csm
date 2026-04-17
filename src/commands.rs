@@ -29,9 +29,11 @@ fn now_str() -> String {
 }
 
 fn copilot_command(uuid: &str) -> Result<String> {
-    if !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-        bail!("Invalid UUID format: {uuid}");
-    }
+    // Strict UUID parsing (defense in depth): even though we generate UUIDs
+    // internally, this string ends up being typed into a zellij pane, so we
+    // never want to allow shell metacharacters or other surprises through if
+    // the database is ever corrupted or hand-edited.
+    Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
     Ok(format!("copilot --yolo --no-remote --autopilot --resume={uuid}"))
 }
 
@@ -68,12 +70,21 @@ async fn resolve_session(db: &DatabaseConnection, query: &str) -> Result<session
     match matches.len() {
         0 => bail!("No session found matching '{query}'"),
         1 => Ok(matches.into_iter().next().unwrap()),
-        n => bail!("Ambiguous identifier '{query}' matches {n} sessions"),
+        _ => {
+            let names: Vec<String> = matches.iter().map(|s| s.name.clone()).collect();
+            bail!(
+                "Ambiguous identifier '{query}' matches {} sessions: {}. Use a longer prefix.",
+                names.len(),
+                names.join(", ")
+            );
+        }
     }
 }
 
 /// Run the zellij client, then update last_used_at when the user detaches.
-/// Aborts the command injector (if any) if zellij fails to start.
+/// Aborts and joins the command injector (if any) before returning, so that
+/// callers can safely run cleanup after this function returns without racing
+/// the injector task.
 /// If the user quit zellij (Ctrl+q), cleans up the exited session so it
 /// shows as "stopped" rather than "exited" in `csm ls`.
 async fn enter_zellij(
@@ -85,10 +96,15 @@ async fn enter_zellij(
 ) -> Result<()> {
     let result = cmd.status().context("Failed to run zellij");
 
+    // Always tear down the injector before returning so that no background
+    // task can race with caller-side cleanup (e.g. removing the worktree
+    // after a failed run).
+    if let Some(handle) = injector {
+        handle.abort();
+        let _ = handle.await;
+    }
+
     if result.is_err() {
-        if let Some(handle) = injector {
-            handle.abort();
-        }
         return result.map(|_| ());
     }
 
@@ -97,6 +113,11 @@ async fn enter_zellij(
         let mut active: ActiveModel = session.into();
         active.last_used_at = Set(now_str());
         active.update(db).await?;
+    } else {
+        eprintln!(
+            "Warning: session '{session_name}' missing from database after detach; \
+             zellij session '{zellij_name}' may be orphaned."
+        );
     }
 
     // If the user quit (Ctrl+q), the session is EXITED but not removed.
@@ -107,6 +128,22 @@ async fn enter_zellij(
     }
 
     Ok(())
+}
+
+/// Spawn the copilot injector and run the zellij client in a fresh session.
+/// Used by `run`, `start`, and `restore`, which all share the same startup
+/// shape (create-or-resume session, inject the copilot command, attach).
+async fn start_zellij_session(
+    db: &DatabaseConnection,
+    session_name: &str,
+    zellij_name: &str,
+    uuid: &str,
+    worktree: &str,
+) -> Result<()> {
+    let injector = zellij::spawn_command_injector(zellij_name.to_string(), copilot_command(uuid)?);
+    let mut cmd = Command::new("zellij");
+    cmd.args(["-s", zellij_name]).current_dir(worktree);
+    enter_zellij(db, session_name, zellij_name, cmd, Some(injector)).await
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -130,12 +167,20 @@ pub async fn run(name: &str) -> Result<()> {
     let source_repo = git::repo_root()?;
     let repo_name = git::repo_name(&source_repo);
     let zellij_name = display::short_uuid(&uuid);
-    let worktree = dir
+    let worktree_path = dir
         .join("worktrees")
         .join(&repo_name)
-        .join(format!("{repo_name}-{zellij_name}"))
-        .to_string_lossy()
-        .to_string();
+        .join(format!("{repo_name}-{zellij_name}"));
+
+    // Defense in depth: ensure the constructed path lives under ~/.csm.
+    if !worktree_path.starts_with(&dir) {
+        bail!(
+            "Refusing to create worktree outside of {}: {}",
+            dir.display(),
+            worktree_path.display()
+        );
+    }
+    let worktree = worktree_path.to_string_lossy().to_string();
 
     let new_branch = !git::branch_exists(&branch, None);
     git::create_worktree(&worktree, &branch, new_branch, None)?;
@@ -146,22 +191,21 @@ pub async fn run(name: &str) -> Result<()> {
         copilot_uuid: Set(uuid.clone()),
         source_repo: Set(source_repo.clone()),
         worktree_path: Set(worktree.clone()),
-        status: Set("active".to_string()),
+        status: Set(STATUS_ACTIVE.to_string()),
         last_used_at: Set(now_str()),
     };
     model.insert(&db).await?;
 
     eprintln!("Created session '{name}' (branch: {branch}, uuid: {uuid})");
-    let injector = zellij::spawn_command_injector(zellij_name.clone(), copilot_command(&uuid)?);
-    let mut cmd = Command::new("zellij");
-    cmd.args(["-s", zellij_name.as_str()]).current_dir(&worktree);
-    let result = enter_zellij(&db, name, &zellij_name, cmd, Some(injector)).await;
+    let result = start_zellij_session(&db, name, &zellij_name, &uuid, &worktree).await;
 
     if result.is_err() {
         let _ = session::Entity::delete_by_id(name.to_string())
             .exec(&db)
             .await;
-        git::remove_worktree(&source_repo, &worktree);
+        if let Err(e) = git::remove_worktree(&source_repo, &worktree) {
+            eprintln!("Warning: cleanup after failed run: {e}");
+        }
     }
     result
 }
@@ -192,10 +236,7 @@ pub async fn start(name: &str) -> Result<()> {
     active.update(&db).await?;
 
     eprintln!("Starting session '{sname}' (uuid: {uuid})");
-    let injector = zellij::spawn_command_injector(zname.clone(), copilot_command(&uuid)?);
-    let mut cmd = Command::new("zellij");
-    cmd.args(["-s", zname.as_str()]).current_dir(&worktree);
-    enter_zellij(&db, &sname, &zname, cmd, Some(injector)).await
+    start_zellij_session(&db, &sname, &zname, &uuid, &worktree).await
 }
 
 pub async fn attach(name: &str) -> Result<()> {
@@ -244,8 +285,13 @@ pub async fn stop(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    zellij::stop_and_cleanup(&zname);
-    println!("Stopped session '{sname}'");
+    if zellij::stop_and_cleanup(&zname) {
+        println!("Stopped session '{sname}'");
+    } else {
+        eprintln!(
+            "Warning: zellij session '{zname}' did not exit within timeout; it may still be present."
+        );
+    }
     Ok(())
 }
 
@@ -280,11 +326,18 @@ pub async fn rm(names: &[String], force: bool) -> Result<()> {
             continue;
         }
 
-        if zs.is_running(&zname) || zs.exists(&zname) {
-            zellij::stop_and_cleanup(&zname);
+        if (zs.is_running(&zname) || zs.exists(&zname))
+            && !zellij::stop_and_cleanup(&zname)
+        {
+            eprintln!(
+                "Warning: zellij session '{zname}' did not exit within timeout; \
+                 continuing with removal."
+            );
         }
 
-        git::remove_worktree(&session.source_repo, &session.worktree_path);
+        if let Err(e) = git::remove_worktree(&session.source_repo, &session.worktree_path) {
+            eprintln!("Warning: {e}; continuing with removal of '{sname}'.");
+        }
 
         if force {
             session::Entity::delete_by_id(sname.to_string())
@@ -293,7 +346,7 @@ pub async fn rm(names: &[String], force: bool) -> Result<()> {
             println!("Destroyed session '{sname}'");
         } else {
             let mut active: ActiveModel = session.into();
-            active.status = Set("removed".to_string());
+            active.status = Set(STATUS_REMOVED.to_string());
             active.update(&db).await?;
             println!("Removed session '{sname}'");
         }
@@ -398,15 +451,12 @@ pub async fn restore(name: &str) -> Result<()> {
     let worktree = session.worktree_path.clone();
 
     let mut active: ActiveModel = session.into();
-    active.status = Set("active".to_string());
+    active.status = Set(STATUS_ACTIVE.to_string());
     active.last_used_at = Set(now_str());
     active.update(&db).await?;
 
     eprintln!("Restored session '{sname}' (uuid: {uuid})");
-    let injector = zellij::spawn_command_injector(zname.clone(), copilot_command(&uuid)?);
-    let mut cmd = Command::new("zellij");
-    cmd.args(["-s", zname.as_str()]).current_dir(&worktree);
-    enter_zellij(&db, &sname, &zname, cmd, Some(injector)).await
+    start_zellij_session(&db, &sname, &zname, &uuid, &worktree).await
 }
 
 pub async fn rename(old: &str, new_name: &str) -> Result<()> {
@@ -416,12 +466,14 @@ pub async fn rename(old: &str, new_name: &str) -> Result<()> {
     let old_name = session.name.clone();
     let zname = zellij_session_name(&session);
 
-    if Session::find_by_id(new_name).one(&db).await?.is_some() {
-        bail!("Session '{new_name}' already exists");
+    if old_name == new_name {
+        bail!("New name is the same as the old name");
     }
 
     // Zellij session name is UUID-based, so it doesn't change on rename.
-    // Just update the DB record.
+    // Just update the DB record. Both the existence check and the
+    // delete+insert happen inside a single transaction so that two
+    // concurrent renames cannot both pass the check and clobber each other.
     let new_session = ActiveModel {
         name: Set(new_name.to_string()),
         branch: Set(session.branch.clone()),
@@ -433,6 +485,10 @@ pub async fn rename(old: &str, new_name: &str) -> Result<()> {
     };
 
     let txn = db.begin().await?;
+    if Session::find_by_id(new_name).one(&txn).await?.is_some() {
+        txn.rollback().await?;
+        bail!("Session '{new_name}' already exists");
+    }
     session::Entity::delete_by_id(old_name.clone())
         .exec(&txn)
         .await?;

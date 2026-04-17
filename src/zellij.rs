@@ -62,16 +62,20 @@ pub fn cleanup(name: &str) {
 }
 
 /// Kill a running zellij session and wait for it to be fully removed.
-/// Polls until the session disappears from the session list (100ms intervals, 5s timeout).
-pub fn stop_and_cleanup(name: &str) {
+/// Polls until the session disappears from the session list (100ms intervals,
+/// 5s timeout). Returns `true` if the session was confirmed removed,
+/// `false` if the timeout elapsed first (zombie session).
+#[must_use = "callers should check whether cleanup actually succeeded"]
+pub fn stop_and_cleanup(name: &str) -> bool {
     stop(name);
     for _ in 0..50 {
         cleanup(name);
         if !session_exists(name) {
-            return;
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    false
 }
 
 fn session_exists(name: &str) -> bool {
