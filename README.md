@@ -31,7 +31,9 @@ cargo install --path .
 csm run <name>
 ```
 
-Creates a Git branch and worktree, starts a Zellij session, and injects the Copilot resume command. The worktree is created under `~/.csm/worktrees/<repo>/<name>`.
+Creates a Git branch (`tylerkrop/<name>`) and worktree, starts a Zellij session, and injects the Copilot resume command. The worktree is created under `~/.csm/worktrees/<repo>/<repo>-<shortcode>`, where `<shortcode>` is the first 8 hex characters of the session's UUID.
+
+Session names must be alphanumeric and may contain `-` or `_`.
 
 ### List sessions
 
@@ -40,13 +42,15 @@ csm list        # active sessions
 csm list -a     # include removed sessions
 ```
 
-Shows session name, status (running/exited/stopped/removed), short ID, and last used time.
+Shows the session shortcode, name, repository, branch, status (running/exited/stopped/removed), and last-used time. Sessions are sorted by status (running first) then most recently used.
 
 ### Attach to a running session
 
 ```sh
 csm attach <name>
 ```
+
+`<name>` may be either the session name or a unique prefix of its UUID shortcode. This applies to every command that takes a session identifier (`attach`, `start`, `stop`, `remove`, `restore`, `rename`).
 
 ### Start a stopped session
 
@@ -99,11 +103,13 @@ csm rename <old> <new>
 
 ## How It Works
 
-1. `csm run` finds the current Git repo, creates a new branch and worktree, and inserts a session record into SQLite.
-2. A Zellij session is started in the worktree directory, identified by the session's UUID.
+1. `csm run` finds the current Git repo, creates a new branch (prefixed with `tylerkrop/`) and worktree, and inserts a session record into SQLite.
+2. A Zellij session is started in the worktree directory, named after the first 8 hex characters of the session's UUID.
 3. A background task waits for Zellij to be ready, then types the Copilot resume command into the first pane.
-4. On detach, the `last_used_at` timestamp is updated.
+4. On detach, the `last_used_at` timestamp is updated. If the user quit Zellij entirely (e.g. `Ctrl+q`), the exited Zellij session is cleaned up so it shows as `stopped` in `csm list`.
 5. Sessions can be stopped, restarted, removed, or restored independently — the underlying Git branch persists until explicitly destroyed with `remove -f`.
+
+The SQLite database is opened in WAL mode with a 5-second busy timeout, so multiple `csm` invocations can run concurrently without `SQLITE_BUSY` errors.
 
 ## Data Storage
 
@@ -111,12 +117,12 @@ All data lives under `~/.csm/`:
 
 ```
 ~/.csm/
-├── sessions.db                    # SQLite database
+├── sessions.db                              # SQLite database
 └── worktrees/
     └── <repo>/
-        └── <session-name>/        # Git worktree
+        └── <repo>-<shortcode>/              # Git worktree
 ```
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+This project does not yet have a license file. All rights reserved by the author until one is added.
