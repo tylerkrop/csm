@@ -358,6 +358,13 @@ pub async fn rm(names: &[String], force: bool) -> Result<()> {
 pub async fn list(show_all: bool) -> Result<()> {
     let db = crate::db::connect().await?;
 
+    let all_hex_ids: Vec<String> = Session::find()
+        .all(&db)
+        .await?
+        .iter()
+        .map(|s| display::uuid_hex(&s.copilot_uuid))
+        .collect();
+
     let sessions = if show_all {
         Session::find()
             .order_by_desc(Column::LastUsedAt)
@@ -402,7 +409,7 @@ pub async fn list(show_all: bool) -> Result<()> {
         .iter()
         .map(|(s, _)| display::uuid_hex(&s.copilot_uuid))
         .collect();
-    let unique_lens = display::shortest_unique_prefixes(&hex_ids);
+    let unique_lens = display::shortest_unique_prefixes_within(&hex_ids, &all_hex_ids);
 
     for (i, (s, status)) in entries.iter().enumerate() {
         let shortcode = display::format_shortcode(&hex_ids[i], unique_lens[i], color);

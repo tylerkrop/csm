@@ -49,13 +49,23 @@ pub fn uuid_hex(uuid: &str) -> String {
 }
 
 /// Compute the shortest unique prefix length for each hex ID in a list.
+#[cfg(test)]
 pub fn shortest_unique_prefixes(hex_ids: &[String]) -> Vec<usize> {
+    shortest_unique_prefixes_within(hex_ids, hex_ids)
+}
+
+/// Compute the shortest unique prefix length for each hex ID in `hex_ids`,
+/// where uniqueness is measured against the full `universe` of hex IDs (which
+/// must include every entry in `hex_ids`). This lets callers display only a
+/// subset of sessions while still producing prefixes that unambiguously
+/// identify the entry across all sessions in storage.
+pub fn shortest_unique_prefixes_within(hex_ids: &[String], universe: &[String]) -> Vec<usize> {
     hex_ids
         .iter()
         .map(|id| {
             for len in 1..=id.len() {
                 let prefix = &id[..len];
-                if hex_ids.iter().filter(|o| o.starts_with(prefix)).count() == 1 {
+                if universe.iter().filter(|o| o.starts_with(prefix)).count() == 1 {
                     return len;
                 }
             }
@@ -169,6 +179,19 @@ mod tests {
         // "abc" is never unique on its own (the other starts with it),
         // so it falls back to full length. "abcd" is unique at len 4.
         assert_eq!(shortest_unique_prefixes(&ids), vec![3, 4]);
+    }
+
+    #[test]
+    fn shortest_unique_prefixes_within_uses_full_universe() {
+        // Visible IDs look unambiguous at len 1 ("a" vs "w"), but the hidden
+        // entry "abff" in the universe forces "abcd" to need a longer prefix.
+        let visible = vec!["abcd".to_string(), "wxyz".to_string()];
+        let universe = vec![
+            "abcd".to_string(),
+            "abff".to_string(),
+            "wxyz".to_string(),
+        ];
+        assert_eq!(shortest_unique_prefixes_within(&visible, &universe), vec![3, 1]);
     }
 
     #[test]
