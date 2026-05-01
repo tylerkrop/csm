@@ -38,8 +38,8 @@ enum Commands {
     /// Stop a session (kill Zellij, keep worktree)
     #[command(alias = "k")]
     Stop {
-        /// Session name or UUID shortcode
-        name: String,
+        /// Session names or UUID shortcodes
+        names: Vec<String>,
     },
     /// Remove a session and its worktree
     #[command(alias = "rm")]
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
         Commands::Run { name } => commands::run(&name).await,
         Commands::Start { name } => commands::start(&name).await,
         Commands::Attach { name } => commands::attach(&name).await,
-        Commands::Stop { name } => commands::stop(&name).await,
+        Commands::Stop { names } => commands::stop(&names).await,
         Commands::Remove { names, force } => commands::rm(&names, force).await,
         Commands::List { all } => commands::list(all).await,
         Commands::Restore { name } => commands::restore(&name).await,

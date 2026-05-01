@@ -270,34 +270,47 @@ pub async fn attach(name: &str) -> Result<()> {
     enter_zellij(&db, &sname, &zname, cmd, None).await
 }
 
-pub async fn stop(name: &str) -> Result<()> {
-    let db = crate::db::connect().await?;
-    let session = resolve_session(&db, name).await?;
-    let sname = &session.name;
-    let zname = zellij_session_name(&session);
-
-    if session.status == STATUS_REMOVED {
-        bail!("Session '{sname}' has been removed");
+pub async fn stop(names: &[String]) -> Result<()> {
+    if names.is_empty() {
+        bail!("No session names provided");
     }
 
+    let db = crate::db::connect().await?;
     let zs = zellij::State::query();
 
-    if !zs.is_running(&zname) {
-        if zs.exists(&zname) {
-            zellij::cleanup(&zname);
-            println!("Cleaned up dead session '{sname}'");
-        } else {
-            println!("Session '{sname}' is not running");
-        }
-        return Ok(());
-    }
+    for name in names {
+        let session = match resolve_session(&db, name).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{e}, skipping");
+                continue;
+            }
+        };
+        let sname = &session.name;
+        let zname = zellij_session_name(&session);
 
-    if zellij::stop_and_cleanup(&zname) {
-        println!("Stopped session '{sname}'");
-    } else {
-        eprintln!(
-            "Warning: zellij session '{zname}' did not exit within timeout; it may still be present."
-        );
+        if session.status == STATUS_REMOVED {
+            eprintln!("Session '{sname}' has been removed, skipping");
+            continue;
+        }
+
+        if !zs.is_running(&zname) {
+            if zs.exists(&zname) {
+                zellij::cleanup(&zname);
+                println!("Cleaned up dead session '{sname}'");
+            } else {
+                println!("Session '{sname}' is not running");
+            }
+            continue;
+        }
+
+        if zellij::stop_and_cleanup(&zname) {
+            println!("Stopped session '{sname}'");
+        } else {
+            eprintln!(
+                "Warning: zellij session '{zname}' did not exit within timeout; it may still be present."
+            );
+        }
     }
     Ok(())
 }
