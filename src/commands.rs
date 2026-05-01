@@ -140,9 +140,16 @@ async fn start_zellij_session(
     uuid: &str,
     worktree: &str,
 ) -> Result<()> {
+    let layout = zellij::ensure_layout()?;
     let injector = zellij::spawn_command_injector(zellij_name.to_string(), copilot_command(uuid)?);
     let mut cmd = Command::new("zellij");
-    cmd.args(["-s", zellij_name]).current_dir(worktree);
+    // `-n` (--new-session-with-layout) always creates a new session from the
+    // given layout file, even when the caller is already inside zellij. We
+    // still pass `-s` to set the session name. `--layout` would instead try
+    // to attach to an existing session and add the layout as new tabs.
+    cmd.args(["-s", zellij_name, "-n"])
+        .arg(&layout)
+        .current_dir(worktree);
     enter_zellij(db, session_name, zellij_name, cmd, Some(injector)).await
 }
 

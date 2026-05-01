@@ -1,4 +1,49 @@
+use std::path::PathBuf;
 use std::process::Command;
+
+use anyhow::{Context, Result};
+
+/// Layout written to `~/.csm/layout.kdl` and passed to every freshly-launched
+/// zellij session. Defines three named tabs:
+/// - "ai" — default shell, focused on launch so the copilot injector types
+///   the resume command into this pane.
+/// - "git" — runs `gitui` in the worktree.
+/// - "edit" — runs `nvim` in the worktree.
+const LAYOUT_KDL: &str = r#"layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        children
+        pane size=1 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+    tab name="ai" focus=true {
+        pane
+    }
+    tab name="git" {
+        pane command="gitui"
+    }
+    tab name="edit" {
+        pane command="nvim"
+    }
+}
+"#;
+
+/// Write the csm zellij layout to `~/.csm/layout.kdl` (overwriting any existing
+/// file so updates to `LAYOUT_KDL` take effect on the next launch) and return
+/// its path so it can be passed to `zellij --layout`.
+pub fn ensure_layout() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let dir = home.join(".csm");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    let path = dir.join("layout.kdl");
+    std::fs::write(&path, LAYOUT_KDL)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
 
 /// Query the current state of all zellij sessions.
 pub struct State {
