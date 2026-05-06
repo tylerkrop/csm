@@ -80,7 +80,8 @@ csm remove -i -f           # interactive picker, destroying selected sessions
 ```
 
 In interactive mode (`-i`), `csm` opens a fullscreen picker listing the active
-sessions:
+sessions. By default already-removed sessions are hidden; press `a` to toggle
+them into the list (combine with `-f` to permanently destroy them).
 
 | Key                | Action                                                  |
 |--------------------|---------------------------------------------------------|
@@ -88,6 +89,7 @@ sessions:
 | `k` / `↑`          | Move cursor up                                          |
 | `g` / `G`          | Jump to top / bottom                                    |
 | `space`            | Toggle selection of the highlighted session             |
+| `a`                | Toggle showing already-removed sessions (mirrors `ls -a`) |
 | `enter`            | Submit selected sessions (then confirm with `y`)        |
 | `/`                | Enter search mode (live filter as you type)             |
 | `enter` (search)   | Return to select mode, keeping the filter               |

@@ -13,10 +13,13 @@ use crossterm::{
 /// (e.g. a session name). `display` is the rendered line shown to the user;
 /// it must be plain text (no ANSI escapes) so the cursor highlight renders
 /// cleanly. `search_text` is matched against the user's filter query.
+/// `hidden` items are excluded from the visible list by default and only
+/// appear when the user toggles "show all" with the `a` key.
 pub struct Item {
     pub key: String,
     pub display: String,
     pub search_text: String,
+    pub hidden: bool,
 }
 
 /// Run a multi-select picker over `items`. Returns:
@@ -92,22 +95,27 @@ struct PickerState {
     /// Indices into `items`, after applying `query`.
     filtered: Vec<usize>,
     title: String,
+    /// When true, items with `hidden: true` are included in `filtered`.
+    /// Toggled by the `a` key, mirroring `ls -a` semantics.
+    show_hidden: bool,
 }
 
 impl PickerState {
     fn new(items: Vec<Item>, title: String) -> Self {
         let n = items.len();
-        let filtered = (0..n).collect();
-        Self {
-            items,
+        let mut s = Self {
             selected: vec![false; n],
             cursor: 0,
             offset: 0,
             mode: Mode::Select,
             query: String::new(),
-            filtered,
+            filtered: Vec::new(),
             title,
-        }
+            show_hidden: false,
+            items,
+        };
+        s.refilter();
+        s
     }
 
     fn refilter(&mut self) {
@@ -120,6 +128,7 @@ impl PickerState {
             .items
             .iter()
             .enumerate()
+            .filter(|(_, it)| self.show_hidden || !it.hidden)
             .filter(|(_, it)| q.is_empty() || it.search_text.to_lowercase().contains(&q))
             .map(|(i, _)| i)
             .collect();
@@ -208,6 +217,20 @@ impl PickerState {
     fn can_confirm(&self) -> bool {
         self.selected_count() > 0 || !self.filtered.is_empty()
     }
+
+    /// Toggle visibility of `hidden` items and re-apply the current filter.
+    /// Selections persist across toggles because they're tracked per item
+    /// index, not per filtered position.
+    fn toggle_show_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.refilter();
+    }
+
+    /// Whether any item in the picker is marked hidden. Used to decide
+    /// whether to surface the `a:all` hint in the footer.
+    fn has_hidden_items(&self) -> bool {
+        self.items.iter().any(|it| it.hidden)
+    }
 }
 
 // ── Event loop ──────────────────────────────────────────────────────────────
@@ -268,6 +291,7 @@ fn handle_select_key(state: &mut PickerState, key: KeyEvent) -> SelectAction {
         KeyCode::PageDown => state.move_cursor(10),
         KeyCode::PageUp => state.move_cursor(-10),
         KeyCode::Char(' ') => state.toggle_selection_at_cursor(),
+        KeyCode::Char('a') => state.toggle_show_hidden(),
         KeyCode::Char('/') => {
             state.mode = Mode::Search;
         }
@@ -454,10 +478,21 @@ fn render_footer(
             if !state.query.is_empty() {
                 parts.push(format!("filter: {}", state.query));
             }
-            parts.push(
+            if state.has_hidden_items() {
+                let hidden_count = state.items.iter().filter(|it| it.hidden).count();
+                let label = if state.show_hidden {
+                    "showing all".to_string()
+                } else {
+                    format!("{hidden_count} hidden")
+                };
+                parts.push(label);
+            }
+            let hint = if state.has_hidden_items() {
+                "j/k:nav  space:select  enter:confirm  /:search  a:all  esc:clear  ctrl-c:cancel"
+            } else {
                 "j/k:nav  space:select  enter:confirm  /:search  esc:clear  ctrl-c:cancel"
-                    .to_string(),
-            );
+            };
+            parts.push(hint.to_string());
             let text = visible_truncate(&parts.join("  |  "), cols);
             queue!(
                 stdout,
@@ -575,6 +610,16 @@ mod tests {
             key: key.to_string(),
             display: key.to_string(),
             search_text: search.to_string(),
+            hidden: false,
+        }
+    }
+
+    fn hidden_item(key: &str, search: &str) -> Item {
+        Item {
+            key: key.to_string(),
+            display: key.to_string(),
+            search_text: search.to_string(),
+            hidden: true,
         }
     }
 
@@ -890,5 +935,84 @@ mod tests {
         // Now clear selections AND filter.
         s.selected = vec![false; 3];
         assert_eq!(pending_remove_count(&s), 0);
+    }
+
+    #[test]
+    fn hidden_items_excluded_by_default() {
+        let items = vec![
+            item("a", "alpha"),
+            hidden_item("b", "bravo"),
+            item("c", "charlie"),
+        ];
+        let s = PickerState::new(items, "test".into());
+        assert_eq!(s.filtered, vec![0, 2]);
+        assert!(!s.show_hidden);
+        assert!(s.has_hidden_items());
+    }
+
+    #[test]
+    fn toggle_show_hidden_includes_hidden_items() {
+        let items = vec![
+            item("a", "alpha"),
+            hidden_item("b", "bravo"),
+            item("c", "charlie"),
+        ];
+        let mut s = PickerState::new(items, "test".into());
+        s.toggle_show_hidden();
+        assert!(s.show_hidden);
+        assert_eq!(s.filtered, vec![0, 1, 2]);
+        s.toggle_show_hidden();
+        assert!(!s.show_hidden);
+        assert_eq!(s.filtered, vec![0, 2]);
+    }
+
+    #[test]
+    fn toggle_show_hidden_keeps_cursor_on_same_item_when_visible() {
+        let items = vec![
+            item("a", "alpha"),
+            hidden_item("b", "bravo"),
+            item("c", "charlie"),
+        ];
+        let mut s = PickerState::new(items, "test".into());
+        s.cursor = 1; // "c" (index 2 in items)
+        s.toggle_show_hidden();
+        // After toggle, "c" is now at filtered position 2.
+        assert_eq!(s.filtered, vec![0, 1, 2]);
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn hidden_selections_persist_across_toggle() {
+        let items = vec![
+            item("a", "alpha"),
+            hidden_item("b", "bravo"),
+        ];
+        let mut s = PickerState::new(items, "test".into());
+        s.toggle_show_hidden();
+        s.cursor = 1; // "b"
+        s.toggle_selection_at_cursor();
+        assert!(s.selected[1]);
+        s.toggle_show_hidden(); // hide hidden again
+        assert_eq!(s.filtered, vec![0]);
+        // Selection on "b" still present and returned by confirmed_keys.
+        assert!(s.selected[1]);
+        assert_eq!(s.confirmed_keys(), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn has_hidden_items_false_when_none_hidden() {
+        let s = build(&[("a", ""), ("b", "")]);
+        assert!(!s.has_hidden_items());
+    }
+
+    #[test]
+    fn handle_select_a_key_toggles_hidden() {
+        let items = vec![item("a", "alpha"), hidden_item("b", "bravo")];
+        let mut s = PickerState::new(items, "test".into());
+        assert_eq!(s.filtered, vec![0]);
+        let action = handle_select_key(&mut s, key(KeyCode::Char('a')));
+        assert!(matches!(action, SelectAction::Continue));
+        assert!(s.show_hidden);
+        assert_eq!(s.filtered, vec![0, 1]);
     }
 }

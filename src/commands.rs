@@ -322,7 +322,7 @@ pub async fn rm(names: &[String], force: bool, interactive: bool) -> Result<()> 
     let names: Vec<String> = if interactive {
         let items = interactive_remove_candidates(&db).await?;
         if items.is_empty() {
-            println!("No active sessions to remove.");
+            println!("No sessions to remove.");
             return Ok(());
         }
         let title = if force {
@@ -403,16 +403,16 @@ pub async fn rm(names: &[String], force: bool, interactive: bool) -> Result<()> 
     Ok(())
 }
 
-/// Build a sorted, formatted list of active sessions for the interactive
-/// picker. Removed sessions are intentionally excluded so that `rm -f -i`
-/// cannot mix already-removed sessions in with destructive operations on
-/// active ones; to permanently destroy already-removed sessions, the
-/// non-interactive form (`csm rm -f <name>`) is still available.
+/// Build a sorted, formatted list of sessions for the interactive picker.
+/// Active sessions (anything not `STATUS_REMOVED`) are visible by default;
+/// already-removed sessions are included as `hidden` items so the picker's
+/// `a` keybind can reveal them on demand. This mirrors `csm ls -a`. Removed
+/// sessions only have an effect when combined with `-f`, since `rm` without
+/// `-f` skips already-removed entries with a warning (see `rm` above).
 async fn interactive_remove_candidates(
     db: &DatabaseConnection,
 ) -> Result<Vec<interactive::Item>> {
     let sessions = Session::find()
-        .filter(Column::Status.ne(STATUS_REMOVED))
         .order_by_desc(Column::LastUsedAt)
         .all(db)
         .await?;
@@ -421,9 +421,7 @@ async fn interactive_remove_candidates(
         return Ok(Vec::new());
     }
 
-    let all_hex_ids: Vec<String> = Session::find()
-        .all(db)
-        .await?
+    let all_hex_ids: Vec<String> = sessions
         .iter()
         .map(|s| display::uuid_hex(&s.copilot_uuid))
         .collect();
@@ -432,8 +430,13 @@ async fn interactive_remove_candidates(
     let mut entries: Vec<(&session::Model, String)> = sessions
         .iter()
         .map(|s| {
-            let zname = zellij_session_name(s);
-            (s, zs.display_status(&zname).to_string())
+            let status = if s.status == STATUS_REMOVED {
+                STATUS_REMOVED.to_string()
+            } else {
+                let zname = zellij_session_name(s);
+                zs.display_status(&zname).to_string()
+            };
+            (s, status)
         })
         .collect();
 
@@ -458,8 +461,12 @@ async fn interactive_remove_candidates(
             // off the cursor row so reverse-video highlighting stays clean.
             let shortcode = display::format_shortcode(&hex_ids[i], unique_lens[i], true);
             let repo = git::repo_name(&s.source_repo);
-            let branch = git::current_branch(&s.worktree_path)
-                .unwrap_or_else(|| s.branch.clone());
+            let branch = if s.status == STATUS_REMOVED {
+                s.branch.clone()
+            } else {
+                git::current_branch(&s.worktree_path)
+                    .unwrap_or_else(|| s.branch.clone())
+            };
             let display_line = display::format_session_line(
                 &shortcode,
                 &s.name,
@@ -477,6 +484,7 @@ async fn interactive_remove_candidates(
                 key: s.name.clone(),
                 display: display_line,
                 search_text,
+                hidden: s.status == STATUS_REMOVED,
             }
         })
         .collect())
