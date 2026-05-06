@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::display;
 use crate::entity::session::{self, ActiveModel, Column, Entity as Session};
 use crate::git;
+use crate::interactive;
 use crate::zellij;
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -315,15 +316,42 @@ pub async fn stop(names: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub async fn rm(names: &[String], force: bool) -> Result<()> {
+pub async fn rm(names: &[String], force: bool, interactive: bool) -> Result<()> {
+    let db = crate::db::connect().await?;
+
+    let names: Vec<String> = if interactive {
+        let items = interactive_remove_candidates(&db).await?;
+        if items.is_empty() {
+            println!("No active sessions to remove.");
+            return Ok(());
+        }
+        let title = if force {
+            "Select sessions to PERMANENTLY destroy"
+        } else {
+            "Select sessions to remove"
+        };
+        match interactive::pick(items, title)? {
+            Some(v) => v,
+            None => {
+                println!("Cancelled");
+                return Ok(());
+            }
+        }
+    } else {
+        if names.is_empty() {
+            bail!("No session names provided");
+        }
+        names.to_vec()
+    };
+
     if names.is_empty() {
-        bail!("No session names provided");
+        println!("No sessions selected");
+        return Ok(());
     }
 
-    let db = crate::db::connect().await?;
     let zs = zellij::State::query();
 
-    for name in names {
+    for name in &names {
         let session = match resolve_session(&db, name).await {
             Ok(s) => s,
             Err(e) => {
@@ -373,6 +401,85 @@ pub async fn rm(names: &[String], force: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build a sorted, formatted list of active sessions for the interactive
+/// picker. Removed sessions are intentionally excluded so that `rm -f -i`
+/// cannot mix already-removed sessions in with destructive operations on
+/// active ones; to permanently destroy already-removed sessions, the
+/// non-interactive form (`csm rm -f <name>`) is still available.
+async fn interactive_remove_candidates(
+    db: &DatabaseConnection,
+) -> Result<Vec<interactive::Item>> {
+    let sessions = Session::find()
+        .filter(Column::Status.ne(STATUS_REMOVED))
+        .order_by_desc(Column::LastUsedAt)
+        .all(db)
+        .await?;
+
+    if sessions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let all_hex_ids: Vec<String> = Session::find()
+        .all(db)
+        .await?
+        .iter()
+        .map(|s| display::uuid_hex(&s.copilot_uuid))
+        .collect();
+
+    let zs = zellij::State::query();
+    let mut entries: Vec<(&session::Model, String)> = sessions
+        .iter()
+        .map(|s| {
+            let zname = zellij_session_name(s);
+            (s, zs.display_status(&zname).to_string())
+        })
+        .collect();
+
+    entries.sort_by(|(a, sa), (b, sb)| {
+        display::status_rank(sa)
+            .cmp(&display::status_rank(sb))
+            .then(b.last_used_at.cmp(&a.last_used_at))
+    });
+
+    let hex_ids: Vec<String> = entries
+        .iter()
+        .map(|(s, _)| display::uuid_hex(&s.copilot_uuid))
+        .collect();
+    let unique_lens = display::shortest_unique_prefixes_within(&hex_ids, &all_hex_ids);
+
+    Ok(entries
+        .iter()
+        .enumerate()
+        .map(|(i, (s, status))| {
+            // Use the same colored renderer as `csm ls`. The picker handles
+            // embedded ANSI escapes when truncating/padding, and strips them
+            // off the cursor row so reverse-video highlighting stays clean.
+            let shortcode = display::format_shortcode(&hex_ids[i], unique_lens[i], true);
+            let repo = git::repo_name(&s.source_repo);
+            let branch = git::current_branch(&s.worktree_path)
+                .unwrap_or_else(|| s.branch.clone());
+            let display_line = display::format_session_line(
+                &shortcode,
+                &s.name,
+                &repo,
+                &branch,
+                status,
+                &s.last_used_at,
+                true,
+            );
+            let search_text = format!(
+                "{} {} {} {} {}",
+                s.name, repo, branch, status, hex_ids[i]
+            );
+            interactive::Item {
+                key: s.name.clone(),
+                display: display_line,
+                search_text,
+            }
+        })
+        .collect())
 }
 
 pub async fn list(show_all: bool) -> Result<()> {

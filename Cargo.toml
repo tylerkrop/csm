@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
 dirs = "6"
 sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 tokio = { version = "1", features = ["full"] }

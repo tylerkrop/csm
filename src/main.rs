@@ -6,6 +6,7 @@ mod db;
 mod display;
 mod entity;
 mod git;
+mod interactive;
 mod zellij;
 
 #[derive(Parser)]
@@ -49,6 +50,9 @@ enum Commands {
         /// Permanently destroy (not restorable)
         #[arg(short, long)]
         force: bool,
+        /// Pick sessions to remove from an interactive list
+        #[arg(short, long, conflicts_with = "names")]
+        interactive: bool,
     },
     /// List sessions (-a includes removed)
     #[command(alias = "ls", alias = "ps")]
@@ -81,7 +85,9 @@ async fn main() -> Result<()> {
         Commands::Start { name } => commands::start(&name).await,
         Commands::Attach { name } => commands::attach(&name).await,
         Commands::Stop { names } => commands::stop(&names).await,
-        Commands::Remove { names, force } => commands::rm(&names, force).await,
+        Commands::Remove { names, force, interactive } => {
+            commands::rm(&names, force, interactive).await
+        }
         Commands::List { all } => commands::list(all).await,
         Commands::Restore { name } => commands::restore(&name).await,
         Commands::Rename { old, new } => commands::rename(&old, &new).await,

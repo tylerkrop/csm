@@ -75,7 +75,32 @@ Kills the Zellij session but keeps the worktree and branch intact.
 ```sh
 csm remove <name>...       # soft remove (keeps branch)
 csm remove <name>... -f    # destroy worktree and branch
+csm remove -i              # interactive multi-select picker
+csm remove -i -f           # interactive picker, destroying selected sessions
 ```
+
+In interactive mode (`-i`), `csm` opens a fullscreen picker listing the active
+sessions:
+
+| Key                | Action                                                  |
+|--------------------|---------------------------------------------------------|
+| `j` / `↓`          | Move cursor down                                        |
+| `k` / `↑`          | Move cursor up                                          |
+| `g` / `G`          | Jump to top / bottom                                    |
+| `space`            | Toggle selection of the highlighted session             |
+| `enter`            | Submit selected sessions (then confirm with `y`)        |
+| `/`                | Enter search mode (live filter as you type)             |
+| `enter` (search)   | Return to select mode, keeping the filter               |
+| `esc`              | Clear the filter (works from select mode too)           |
+| `y` (confirm)      | Confirm removal                                         |
+| any other (confirm)| Cancel the prompt and return to select mode             |
+| `ctrl-c`           | Cancel without removing anything                        |
+
+If no sessions are explicitly selected with `space`, pressing `enter` removes
+the highlighted session only. Selections are preserved across filter changes,
+so a hidden session that was selected before filtering will still be removed.
+A `y/N` confirmation step protects against accidental double-Enter (e.g. after
+finishing a search).
 
 ### Restore a removed session
 
