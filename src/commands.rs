@@ -35,7 +35,7 @@ fn copilot_command(uuid: &str) -> Result<String> {
     // never want to allow shell metacharacters or other surprises through if
     // the database is ever corrupted or hand-edited.
     Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
-    Ok(format!("copilot --yolo --no-remote --autopilot --resume={uuid}"))
+    Ok(format!("copilot --yolo --no-remote --autopilot --name={uuid}"))
 }
 
 /// The zellij session name is the 8-char hex prefix of the copilot UUID.
@@ -672,7 +672,7 @@ mod tests {
         let uuid = uuid::Uuid::new_v4().to_string();
         let cmd = copilot_command(&uuid).expect("valid uuid");
         assert!(cmd.contains(&uuid));
-        assert!(cmd.starts_with("copilot --yolo --no-remote --autopilot --resume="));
+        assert!(cmd.starts_with("copilot --yolo --no-remote --autopilot --name="));
     }
 
     #[test]
