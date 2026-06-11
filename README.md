@@ -60,7 +60,8 @@ csm attach <name>
 csm start <name>
 ```
 
-Recreates the Zellij session and re-injects the Copilot command.
+Recreates the Zellij session and resumes Copilot with `--resume`, so the
+session's prior conversation context is restored rather than started fresh.
 
 ### Stop a session
 
@@ -134,7 +135,7 @@ csm rename <old> <new>
 
 1. `csm run` finds the current Git repo, creates a new branch (prefixed with `tylerkrop/`) and worktree, and inserts a session record into SQLite.
 2. A Zellij session is started in the worktree directory, named after the first 8 hex characters of the session's UUID. The session uses a layout (written to `~/.csm/layout.kdl`) with three named tabs: `ai` (default shell, focused), `git` (runs `gitui`), and `edit` (runs `nvim`).
-3. A background task waits for Zellij to be ready, then types the Copilot resume command into the focused pane (the `ai` tab).
+3. A background task waits for Zellij to be ready, then types the Copilot command into the focused pane (the `ai` tab). A brand-new session (`csm run`) is launched with `copilot --name=<uuid>`; restarting an existing session (`csm start`/`csm restore`) uses `copilot --resume=<uuid>` so Copilot resumes that session's context instead of creating a duplicate that merely shares the name.
 4. On detach, the `last_used_at` timestamp is updated. If the user quit Zellij entirely (e.g. `Ctrl+q`), the exited Zellij session is cleaned up so it shows as `stopped` in `csm list`.
 5. Sessions can be stopped, restarted, removed, or restored independently — the underlying Git branch persists until explicitly destroyed with `remove -f`.
 

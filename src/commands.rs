@@ -29,13 +29,21 @@ fn now_str() -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn copilot_command(uuid: &str) -> Result<String> {
+/// Build the copilot launch command for a session.
+///
+/// `run` starts a brand-new session and uses `--name=<uuid>` so the copilot
+/// session is tagged with our stable UUID. Restarting an existing session
+/// (`start`/`restore`) instead passes `--resume=<uuid>`, which matches that
+/// session by name (exact, case-insensitive) and resumes its context rather
+/// than spawning a fresh session that merely shares the same name.
+fn copilot_command(uuid: &str, resume: bool) -> Result<String> {
     // Strict UUID parsing (defense in depth): even though we generate UUIDs
     // internally, this string ends up being typed into a zellij pane, so we
     // never want to allow shell metacharacters or other surprises through if
     // the database is ever corrupted or hand-edited.
     Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
-    Ok(format!("copilot --yolo --no-remote --autopilot --name={uuid}"))
+    let flag = if resume { "resume" } else { "name" };
+    Ok(format!("copilot --yolo --no-remote --autopilot --{flag}={uuid}"))
 }
 
 /// The zellij session name is the 8-char hex prefix of the copilot UUID.
@@ -133,16 +141,20 @@ async fn enter_zellij(
 
 /// Spawn the copilot injector and run the zellij client in a fresh session.
 /// Used by `run`, `start`, and `restore`, which all share the same startup
-/// shape (create-or-resume session, inject the copilot command, attach).
+/// shape (inject the copilot command, then attach). Pass `resume = false` for
+/// a brand-new session (`run`) and `resume = true` when relaunching an
+/// existing session (`start`/`restore`) so copilot resumes its context.
 async fn start_zellij_session(
     db: &DatabaseConnection,
     session_name: &str,
     zellij_name: &str,
     uuid: &str,
     worktree: &str,
+    resume: bool,
 ) -> Result<()> {
     let layout = zellij::ensure_layout()?;
-    let injector = zellij::spawn_command_injector(zellij_name.to_string(), copilot_command(uuid)?);
+    let injector =
+        zellij::spawn_command_injector(zellij_name.to_string(), copilot_command(uuid, resume)?);
     let mut cmd = Command::new("zellij");
     // `-n` (--new-session-with-layout) always creates a new session from the
     // given layout file, even when the caller is already inside zellij. We
@@ -205,7 +217,7 @@ pub async fn run(name: &str) -> Result<()> {
     model.insert(&db).await?;
 
     eprintln!("Created session '{name}' (branch: {branch}, uuid: {uuid})");
-    let result = start_zellij_session(&db, name, &zellij_name, &uuid, &worktree).await;
+    let result = start_zellij_session(&db, name, &zellij_name, &uuid, &worktree, false).await;
 
     if result.is_err() {
         let _ = session::Entity::delete_by_id(name.to_string())
@@ -244,7 +256,7 @@ pub async fn start(name: &str) -> Result<()> {
     active.update(&db).await?;
 
     eprintln!("Starting session '{sname}' (uuid: {uuid})");
-    start_zellij_session(&db, &sname, &zname, &uuid, &worktree).await
+    start_zellij_session(&db, &sname, &zname, &uuid, &worktree, true).await
 }
 
 pub async fn attach(name: &str) -> Result<()> {
@@ -598,7 +610,7 @@ pub async fn restore(name: &str) -> Result<()> {
     active.update(&db).await?;
 
     eprintln!("Restored session '{sname}' (uuid: {uuid})");
-    start_zellij_session(&db, &sname, &zname, &uuid, &worktree).await
+    start_zellij_session(&db, &sname, &zname, &uuid, &worktree, true).await
 }
 
 pub async fn rename(old: &str, new_name: &str) -> Result<()> {
@@ -668,11 +680,19 @@ mod tests {
     }
 
     #[test]
-    fn copilot_command_accepts_real_uuid() {
+    fn copilot_command_new_session_uses_name() {
         let uuid = uuid::Uuid::new_v4().to_string();
-        let cmd = copilot_command(&uuid).expect("valid uuid");
+        let cmd = copilot_command(&uuid, false).expect("valid uuid");
         assert!(cmd.contains(&uuid));
         assert!(cmd.starts_with("copilot --yolo --no-remote --autopilot --name="));
+    }
+
+    #[test]
+    fn copilot_command_restart_uses_resume() {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let cmd = copilot_command(&uuid, true).expect("valid uuid");
+        assert!(cmd.contains(&uuid));
+        assert!(cmd.starts_with("copilot --yolo --no-remote --autopilot --resume="));
     }
 
     #[test]
@@ -687,7 +707,14 @@ mod tests {
             "12345678-1234-1234-1234-12345678", // too short
             "not-a-uuid-at-all-really-no",
         ] {
-            assert!(copilot_command(bad).is_err(), "expected '{bad}' to be rejected");
+            assert!(
+                copilot_command(bad, false).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+            assert!(
+                copilot_command(bad, true).is_err(),
+                "expected '{bad}' to be rejected"
+            );
         }
     }
 }
