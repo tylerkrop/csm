@@ -54,12 +54,44 @@ fn copilot_command(uuid: &str, resume: bool) -> Result<String> {
     // the database is ever corrupted or hand-edited.
     Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
     let flag = if resume { "resume" } else { "name" };
-    Ok(format!("copilot --yolo --no-remote --autopilot --{flag}={uuid}"))
+    Ok(format!("copilot --yolo --autopilot --{flag}={uuid}"))
 }
 
 /// The zellij session name is the 8-char hex prefix of the copilot UUID.
 fn zellij_session_name(session: &session::Model) -> String {
     display::short_uuid(&session.copilot_uuid)
+}
+
+/// Prompt the user for a yes/no answer on stderr, reading a line from stdin.
+/// Returns `true` only for an explicit yes; the default (empty input, EOF, or
+/// a non-tty where the read fails) is `false`.
+fn confirm(prompt: &str) -> bool {
+    use std::io::{self, Write};
+    eprint!("{prompt} [y/N] ");
+    let _ = io::stderr().flush();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Find an unused session name derived from `base`. Returns `base` unchanged if
+/// no session row currently uses it, otherwise appends `-2`, `-3`, … until a
+/// free name is found. This lets the same branch name be reused across
+/// repositories without a hard error, since the DB primary key is the human
+/// session name.
+async fn next_available_name(db: &DatabaseConnection, base: &str) -> Result<String> {
+    if Session::find_by_id(base).one(db).await?.is_none() {
+        return Ok(base.to_string());
+    }
+    for n in 2.. {
+        let candidate = format!("{base}-{n}");
+        if Session::find_by_id(&candidate).one(db).await?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("integer range is effectively unbounded")
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -162,8 +194,9 @@ async fn start_zellij_session(
     uuid: &str,
     worktree: &str,
     resume: bool,
+    include_git: bool,
 ) -> Result<()> {
-    let layout = zellij::ensure_layout()?;
+    let layout = zellij::ensure_layout(include_git)?;
     let config = zellij::ensure_config()?;
     let injector =
         zellij::spawn_command_injector(zellij_name.to_string(), copilot_command(uuid, resume)?);
@@ -182,72 +215,114 @@ async fn start_zellij_session(
 
 // ── Commands ────────────────────────────────────────────────────────────────
 
-pub async fn run(name: &str) -> Result<()> {
+pub async fn run(name: &str, here: bool) -> Result<()> {
     validate_name(name)?;
     let db = crate::db::connect().await?;
     let dir = csm_dir()?;
 
-    if let Some(existing) = Session::find_by_id(name).one(&db).await? {
-        if existing.status == STATUS_ACTIVE {
-            bail!("Session '{name}' already exists. Use `csm attach {name}` to connect.");
+    // Resolve the DB session name (primary key). A removed session's name is
+    // reclaimed; a live collision is disambiguated with a numeric suffix so the
+    // same branch name can be reused across repositories without an error. The
+    // branch itself always derives from the requested name, not the suffixed
+    // session name.
+    let session_name = match Session::find_by_id(name).one(&db).await? {
+        Some(existing) if existing.status == STATUS_ACTIVE => {
+            let unique = next_available_name(&db, name).await?;
+            eprintln!("Session name '{name}' is already in use; using '{unique}' instead.");
+            unique
         }
-        session::Entity::delete_by_id(name.to_string())
-            .exec(&db)
-            .await?;
-    }
+        Some(_) => {
+            session::Entity::delete_by_id(name.to_string())
+                .exec(&db)
+                .await?;
+            name.to_string()
+        }
+        None => name.to_string(),
+    };
 
     let uuid = Uuid::new_v4().to_string();
     let zellij_name = display::short_uuid(&uuid);
 
-    // When not inside a git repository, skip branch/worktree creation and run
-    // copilot directly in the current directory. `created_worktree` tracks
-    // whether csm owns the worktree, so cleanup never touches the user's dir.
-    let (branch, source_repo, worktree, created_worktree) = match git::repo_root().ok() {
-        Some(source_repo) => {
-            // On a default branch (main/master), pull latest before branching
-            // so the new worktree starts from up-to-date history.
-            if let Some(current) = git::current_branch(&source_repo)
-                && (current == "main" || current == "master")
-            {
-                eprintln!("On default branch '{current}', pulling latest changes...");
-                if let Err(e) = git::pull(&source_repo) {
-                    eprintln!("Warning: {e}");
+    // Determine where copilot runs. Three cases:
+    // - `--here`: run directly in the current directory (no branch/worktree),
+    //   even inside a git repo. Useful for hobby projects.
+    // - inside a git repo: create a branch + worktree under ~/.csm.
+    // - not in a git repo: run directly in the current directory.
+    // `created_worktree` tracks whether csm owns the worktree so cleanup never
+    // touches the user's own directory.
+    let (branch, source_repo, worktree, created_worktree) = if here {
+        let cwd = std::env::current_dir()
+            .context("Could not determine current directory")?
+            .to_string_lossy()
+            .to_string();
+        // Prefer the repo root as the source repo for display purposes; fall
+        // back to the cwd when not in a git repository.
+        let source_repo = git::repo_root().unwrap_or_else(|_| cwd.clone());
+        eprintln!("Running directly in '{cwd}' without a worktree.");
+        (String::new(), source_repo, cwd, false)
+    } else {
+        match git::repo_root().ok() {
+            Some(source_repo) => {
+                // On a default branch (main/master), pull latest before branching
+                // so the new worktree starts from up-to-date history.
+                if let Some(current) = git::current_branch(&source_repo)
+                    && (current == "main" || current == "master")
+                {
+                    eprintln!("On default branch '{current}', pulling latest changes...");
+                    if let Err(e) = git::pull(&source_repo) {
+                        eprintln!("Warning: {e}");
+                    }
                 }
+
+                let branch = format!("{BRANCH_PREFIX}/{name}");
+                let repo_name = git::repo_name(&source_repo);
+                let worktree_path = dir
+                    .join("worktrees")
+                    .join(&repo_name)
+                    .join(format!("{repo_name}-{zellij_name}"));
+
+                // Defense in depth: ensure the constructed path lives under ~/.csm.
+                if !worktree_path.starts_with(&dir) {
+                    bail!(
+                        "Refusing to create worktree outside of {}: {}",
+                        dir.display(),
+                        worktree_path.display()
+                    );
+                }
+                let worktree = worktree_path.to_string_lossy().to_string();
+
+                let new_branch = !git::branch_exists(&branch, None);
+                // If the branch already exists, warn and confirm before resuming
+                // it, since silently reusing old branch history is confusing.
+                if !new_branch
+                    && !confirm(&format!(
+                        "Branch '{branch}' already exists and will be resumed in a new worktree. Continue?"
+                    ))
+                {
+                    bail!("Aborted: branch '{branch}' already exists.");
+                }
+                git::create_worktree(&worktree, &branch, new_branch, None)?;
+                (branch, source_repo, worktree, true)
             }
-
-            let branch = format!("{BRANCH_PREFIX}/{name}");
-            let repo_name = git::repo_name(&source_repo);
-            let worktree_path = dir
-                .join("worktrees")
-                .join(&repo_name)
-                .join(format!("{repo_name}-{zellij_name}"));
-
-            // Defense in depth: ensure the constructed path lives under ~/.csm.
-            if !worktree_path.starts_with(&dir) {
-                bail!(
-                    "Refusing to create worktree outside of {}: {}",
-                    dir.display(),
-                    worktree_path.display()
+            None => {
+                let cwd = std::env::current_dir()
+                    .context("Could not determine current directory")?
+                    .to_string_lossy()
+                    .to_string();
+                eprintln!(
+                    "Not in a git repository; running in current directory without a worktree."
                 );
+                (String::new(), cwd.clone(), cwd, false)
             }
-            let worktree = worktree_path.to_string_lossy().to_string();
-
-            let new_branch = !git::branch_exists(&branch, None);
-            git::create_worktree(&worktree, &branch, new_branch, None)?;
-            (branch, source_repo, worktree, true)
-        }
-        None => {
-            let cwd = std::env::current_dir()
-                .context("Could not determine current directory")?
-                .to_string_lossy()
-                .to_string();
-            eprintln!("Not in a git repository; running in current directory without a worktree.");
-            (String::new(), cwd.clone(), cwd, false)
         }
     };
 
+    // Only include the gitui tab when the working directory is a git repo;
+    // otherwise gitui fails to launch.
+    let include_git = git::is_git_repo(&worktree);
+
     let model = ActiveModel {
-        name: Set(name.to_string()),
+        name: Set(session_name.clone()),
         branch: Set(branch.clone()),
         copilot_uuid: Set(uuid.clone()),
         source_repo: Set(source_repo.clone()),
@@ -258,14 +333,23 @@ pub async fn run(name: &str) -> Result<()> {
     model.insert(&db).await?;
 
     if branch.is_empty() {
-        eprintln!("Created session '{name}' (uuid: {uuid})");
+        eprintln!("Created session '{session_name}' (uuid: {uuid})");
     } else {
-        eprintln!("Created session '{name}' (branch: {branch}, uuid: {uuid})");
+        eprintln!("Created session '{session_name}' (branch: {branch}, uuid: {uuid})");
     }
-    let result = start_zellij_session(&db, name, &zellij_name, &uuid, &worktree, false).await;
+    let result = start_zellij_session(
+        &db,
+        &session_name,
+        &zellij_name,
+        &uuid,
+        &worktree,
+        false,
+        include_git,
+    )
+    .await;
 
     if result.is_err() {
-        let _ = session::Entity::delete_by_id(name.to_string())
+        let _ = session::Entity::delete_by_id(session_name.clone())
             .exec(&db)
             .await;
         if created_worktree
@@ -303,7 +387,8 @@ pub async fn start(name: &str) -> Result<()> {
     active.update(&db).await?;
 
     eprintln!("Starting session '{sname}' (uuid: {uuid})");
-    start_zellij_session(&db, &sname, &zname, &uuid, &worktree, true).await
+    let include_git = git::is_git_repo(&worktree);
+    start_zellij_session(&db, &sname, &zname, &uuid, &worktree, true, include_git).await
 }
 
 pub async fn attach(name: &str) -> Result<()> {
@@ -701,7 +786,8 @@ pub async fn restore(name: &str) -> Result<()> {
     active.update(&db).await?;
 
     eprintln!("Restored session '{sname}' (uuid: {uuid})");
-    start_zellij_session(&db, &sname, &zname, &uuid, &worktree, true).await
+    let include_git = git::is_git_repo(&worktree);
+    start_zellij_session(&db, &sname, &zname, &uuid, &worktree, true, include_git).await
 }
 
 pub async fn rename(old: &str, new_name: &str) -> Result<()> {
@@ -775,7 +861,7 @@ mod tests {
         let uuid = uuid::Uuid::new_v4().to_string();
         let cmd = copilot_command(&uuid, false).expect("valid uuid");
         assert!(cmd.contains(&uuid));
-        assert!(cmd.starts_with("copilot --yolo --no-remote --autopilot --name="));
+        assert!(cmd.starts_with("copilot --yolo --autopilot --name="));
     }
 
     #[test]
@@ -783,7 +869,7 @@ mod tests {
         let uuid = uuid::Uuid::new_v4().to_string();
         let cmd = copilot_command(&uuid, true).expect("valid uuid");
         assert!(cmd.contains(&uuid));
-        assert!(cmd.starts_with("copilot --yolo --no-remote --autopilot --resume="));
+        assert!(cmd.starts_with("copilot --yolo --autopilot --resume="));
     }
 
     #[test]

@@ -23,6 +23,10 @@ enum Commands {
     Run {
         /// Branch name suffix (full branch: tylerkrop/<name>)
         name: String,
+        /// Skip worktree creation and run copilot directly in the current
+        /// directory (no branch/worktree). Useful for hobby projects.
+        #[arg(long)]
+        here: bool,
     },
     /// Start a stopped session and attach
     #[command(alias = "s")]
@@ -84,7 +88,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { name } => commands::run(&name).await,
+        Commands::Run { name, here } => commands::run(&name, here).await,
         Commands::Start { name } => commands::start(&name).await,
         Commands::Attach { name } => commands::attach(&name).await,
         Commands::Stop { names } => commands::stop(&names).await,

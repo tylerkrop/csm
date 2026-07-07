@@ -3,33 +3,43 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-/// Layout written to `~/.csm/layout.kdl` and passed to every freshly-launched
-/// zellij session. Defines three named tabs:
+/// Build the zellij layout KDL. The `include_git` flag controls whether the
+/// "git" tab (which runs `gitui`) is present: `gitui` fails outside a git
+/// repository, so callers omit that tab for sessions started in a non-git
+/// directory.
+///
+/// Defines up to three named tabs:
 /// - "ai" — default shell, focused on launch so the copilot injector types
 ///   the resume command into this pane.
-/// - "git" — runs `gitui` in the worktree.
+/// - "git" — runs `gitui` in the worktree (only when `include_git`).
 /// - "edit" — runs `nvim` in the worktree.
-const LAYOUT_KDL: &str = r#"layout {
-    default_tab_template {
-        pane size=1 borderless=true {
+fn layout_kdl(include_git: bool) -> String {
+    let git_tab = if include_git {
+        "    tab name=\"git\" {\n        pane command=\"gitui\"\n    }\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"layout {{
+    default_tab_template {{
+        pane size=1 borderless=true {{
             plugin location="tab-bar"
-        }
+        }}
         children
-        pane size=1 borderless=true {
+        pane size=1 borderless=true {{
             plugin location="status-bar"
-        }
-    }
-    tab name="ai" focus=true {
+        }}
+    }}
+    tab name="ai" focus=true {{
         pane
-    }
-    tab name="git" {
-        pane command="gitui"
-    }
-    tab name="edit" {
+    }}
+{git_tab}    tab name="edit" {{
         pane command="nvim"
-    }
+    }}
+}}
+"#
+    )
 }
-"#;
 
 /// Zellij configuration written to `~/.csm/config.kdl` and passed to every
 /// freshly-launched session via `--config`. Uses the simplified (ASCII) UI
@@ -38,16 +48,19 @@ const CONFIG_KDL: &str = r#"simplified_ui true
 pane_frames false
 "#;
 
-/// Write the csm zellij layout to `~/.csm/layout.kdl` (overwriting any existing
-/// file so updates to `LAYOUT_KDL` take effect on the next launch) and return
-/// its path so it can be passed to `zellij --layout`.
-pub fn ensure_layout() -> Result<PathBuf> {
+/// Write the csm zellij layout to `~/.csm/` (overwriting any existing file so
+/// updates take effect on the next launch) and return its path so it can be
+/// passed to `zellij -n`. `include_git` selects the git-tab variant; each
+/// variant is written to a distinct file so concurrent launches with different
+/// settings don't clobber each other's layout.
+pub fn ensure_layout(include_git: bool) -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let dir = home.join(".csm");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create {}", dir.display()))?;
-    let path = dir.join("layout.kdl");
-    std::fs::write(&path, LAYOUT_KDL)
+    let file = if include_git { "layout.kdl" } else { "layout-nogit.kdl" };
+    let path = dir.join(file);
+    std::fs::write(&path, layout_kdl(include_git))
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(path)
 }
@@ -237,5 +250,19 @@ fed09876 [Created 1h ago]\n";
         assert_eq!(s.display_status("a"), "running");
         assert_eq!(s.display_status("b"), "exited");
         assert_eq!(s.display_status("c"), "stopped");
+    }
+
+    #[test]
+    fn layout_includes_git_tab_conditionally() {
+        let with_git = layout_kdl(true);
+        assert!(with_git.contains("command=\"gitui\""));
+        assert!(with_git.contains("name=\"git\""));
+        assert!(with_git.contains("command=\"nvim\""));
+
+        let without_git = layout_kdl(false);
+        assert!(!without_git.contains("gitui"));
+        assert!(!without_git.contains("name=\"git\""));
+        assert!(without_git.contains("command=\"nvim\""));
+        assert!(without_git.contains("name=\"ai\""));
     }
 }

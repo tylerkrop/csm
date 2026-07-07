@@ -37,6 +37,12 @@ Creates a Git branch (`tylerkrop/<name>`) and worktree, starts a Zellij session,
 
 If the current repository is on a default branch (`main` or `master`), csm runs `git pull` first so the new worktree branches from up-to-date history. If you run `csm run` in a directory that is not a Git repository, csm skips branch/worktree creation and starts Copilot directly in the current directory.
 
+If the branch `tylerkrop/<name>` already exists, csm prompts for confirmation before resuming it in a new worktree, so you never silently reuse old branch history.
+
+If the session name is already in use by an active session, csm appends a numeric suffix (`<name>-2`, `<name>-3`, …) instead of erroring. This lets you reuse the same branch name across different repositories; the branch keeps the requested name while the session name is disambiguated. (Most of the time you connect using the UUID shortcode anyway.)
+
+Pass `--here` to skip worktree creation and run Copilot directly in the current directory, even inside a Git repository. This is handy for hobby projects where you don't want to merge from other branches. The `git` tab (gitui) is omitted automatically when the working directory is not a Git repository.
+
 Session names must be alphanumeric and may contain `-` or `_`.
 
 ### List sessions
@@ -141,7 +147,7 @@ csm rename <old> <new>
 ## How It Works
 
 1. `csm run` finds the current Git repo, creates a new branch (prefixed with `tylerkrop/`) and worktree, and inserts a session record into SQLite.
-2. A Zellij session is started in the worktree directory, named after the first 8 hex characters of the session's UUID. The session uses a layout (written to `~/.csm/layout.kdl`) with three named tabs: `ai` (default shell, focused), `git` (runs `gitui`), and `edit` (runs `nvim`). A config (written to `~/.csm/config.kdl`) enables the simplified ASCII UI (`simplified_ui`) and removes pane frames/borders (`pane_frames false`).
+2. A Zellij session is started in the worktree directory, named after the first 8 hex characters of the session's UUID. The session uses a layout (written to `~/.csm/layout.kdl`, or `~/.csm/layout-nogit.kdl` when there is no Git repo) with named tabs: `ai` (default shell, focused), `git` (runs `gitui`, omitted outside a Git repo), and `edit` (runs `nvim`). A config (written to `~/.csm/config.kdl`) enables the simplified ASCII UI (`simplified_ui`) and removes pane frames/borders (`pane_frames false`).
 3. A background task waits for Zellij to be ready, then types the Copilot command into the focused pane (the `ai` tab). A brand-new session (`csm run`) is launched with `copilot --name=<uuid>`; restarting an existing session (`csm start`/`csm restore`) uses `copilot --resume=<uuid>` so Copilot resumes that session's context instead of creating a duplicate that merely shares the name.
 4. On detach, the `last_used_at` timestamp is updated. If the user quit Zellij entirely (e.g. `Ctrl+q`), the exited Zellij session is cleaned up so it shows as `stopped` in `csm list`.
 5. Sessions can be stopped, restarted, removed, or restored independently — the underlying Git branch persists until explicitly destroyed with `remove -f`.

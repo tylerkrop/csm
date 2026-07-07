@@ -25,6 +25,17 @@ pub fn repo_name(source_repo: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Check whether the given directory is inside a git work tree. Used to decide
+/// whether to include the `gitui` tab in the zellij layout: launching `gitui`
+/// in a non-git directory fails, so we omit that tab when there is no repo.
+pub fn is_git_repo(path: &str) -> bool {
+    Command::new("git")
+        .args(["-C", path, "rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Check if a git branch exists, optionally scoped to a specific repository.
 pub fn branch_exists(branch: &str, source_repo: Option<&str>) -> bool {
     let mut cmd = Command::new("git");
