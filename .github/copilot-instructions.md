@@ -8,7 +8,7 @@ is named `csm` (see `[[bin]]` in `Cargo.toml`).
 ## Build, test, and lint
 
 - Build: `cargo build` (release: `cargo build --release`).
-- Test: `cargo test` runs the full suite (currently 63 unit tests).
+- Test: `cargo test` runs the full suite (inline unit tests).
 - Run a single test: `cargo test parse_running_and_exited`, or scope to a
   module with `cargo test zellij::tests`.
 - Lint: `cargo clippy`. Format: `cargo fmt`.
@@ -35,7 +35,10 @@ subcommand in `commands.rs`, which orchestrates four lower-level modules.
   is the single SeaORM entity (`Model`/`ActiveModel`) for the `sessions` table.
 - `git.rs` wraps `git` worktree/branch operations via `std::process::Command`.
 - `zellij.rs` wraps the `zellij` CLI: query session state, start/kill/cleanup
-  sessions, write the layout, and inject the Copilot command into a pane.
+  sessions, write the layout (`layout.kdl`, or `layout-nogit.kdl` when there is
+  no Git repo) and config (`config.kdl`), and inject the Copilot command into a
+  pane. The layout has named tabs: `ai` (focused), `git` (gitui, omitted with
+  no repo), and `edit` (nvim).
 - `display.rs` is pure formatting: shortcodes, colors, relative times, status
   ranking. No I/O side effects beyond reading whether stdout is a TTY.
 - `interactive.rs` is a self-contained `crossterm` fullscreen multi-select
@@ -69,4 +72,11 @@ There is no daemon or server. csm shells out to external binaries (`git`,
   drives list/picker ordering alongside `status_rank`.
 - Failures during session creation roll back: `run` deletes the DB row and
   removes the worktree if startup fails. Follow this create-then-cleanup shape.
+- `run` has three modes: normal (new branch + worktree), non-repo (skips
+  branch/worktree, runs Copilot in the cwd), and `--here` (same, but forced even
+  inside a repo). If a session name is taken, `run` appends a numeric suffix
+  (`<name>-2`, …) rather than erroring; the branch keeps the requested name.
+- New sessions launch `copilot --name=<uuid>`; `start`/`restore` use
+  `copilot --resume=<uuid>` to restore prior conversation context. Preserve this
+  new-vs-resume distinction when changing session startup.
 - Source uses `// ── Section ──` comment banners to group helpers vs commands.
