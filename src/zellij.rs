@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -158,6 +159,67 @@ pub fn cleanup_session_files(uuid: &str) {
         let _ = std::fs::remove_file(base.join("markers").join(uuid));
         let _ = std::fs::remove_file(base.join("layouts").join(format!("{uuid}.kdl")));
     }
+}
+
+/// Build the set of filename stems that belong to known sessions: each
+/// session's full UUID plus its 8-char shortcode. Older csm versions named
+/// layout files by shortcode (`<shortcode>.kdl`) rather than the full UUID, so
+/// both forms must be preserved. Pure helper so orphan classification can be
+/// unit-tested without touching the filesystem.
+fn session_file_keys(known: &[String]) -> HashSet<String> {
+    let mut keep = HashSet::new();
+    for uuid in known {
+        keep.insert(uuid.clone());
+        keep.insert(crate::display::short_uuid(uuid));
+    }
+    keep
+}
+
+/// Remove files in `dir` whose stem is not present in `keep`. When `ext` is
+/// `Some`, only files with that extension are considered (others are left
+/// untouched); when `None`, every regular file is considered. Best-effort:
+/// files that fail to delete are skipped. Returns the number removed.
+fn prune_dir(dir: &Path, ext: Option<&str>, keep: &HashSet<String>) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(want) = ext
+            && path.extension().and_then(|e| e.to_str()) != Some(want)
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !keep.contains(stem) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Detect and remove orphaned per-session files under `~/.csm`: layout `.kdl`
+/// files and launcher markers that no longer correspond to any known session.
+/// `known` is every session UUID still in the database (any status). Files
+/// named under the old shortcode scheme are matched too, so this also reaps
+/// layouts written by csm versions predating the UUID filename, as well as
+/// files left behind by failure paths that predate cleanup. Best-effort:
+/// unreadable directories and un-removable files are skipped. Returns the
+/// number of files removed.
+pub fn prune_orphans(known: &[String]) -> usize {
+    let Some(home) = dirs::home_dir() else {
+        return 0;
+    };
+    let base = home.join(".csm");
+    let keep = session_file_keys(known);
+    prune_dir(&base.join("layouts"), Some("kdl"), &keep)
+        + prune_dir(&base.join("markers"), None, &keep)
 }
 
 /// Write the csm zellij config to `~/.csm/config.kdl` (overwriting any existing
@@ -368,5 +430,73 @@ fed09876 [Created 1h ago]\n";
             );
         }
         assert!(validate_uuid("abcdef01-2345-6789-abcd-ef0123456789").is_ok());
+    }
+
+    #[test]
+    fn session_file_keys_include_uuid_and_shortcode() {
+        let uuid = "85963f9a-c04e-4a05-b50d-5c32a0424114";
+        let keys = session_file_keys(&[uuid.to_string()]);
+        assert!(keys.contains(uuid), "full-uuid layout/marker must be kept");
+        assert!(
+            keys.contains("85963f9a"),
+            "old shortcode-named layout must be kept"
+        );
+        assert!(
+            !keys.contains("3a3ae29d"),
+            "unrelated shortcode is orphaned"
+        );
+        assert!(!keys.contains("deadbeef-dead-dead-dead-deaddeaddead"));
+    }
+
+    #[test]
+    fn prune_dir_removes_only_orphans() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("csm-prune-test-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let uuid = "85963f9a-c04e-4a05-b50d-5c32a0424114";
+        fs::write(dir.join(format!("{uuid}.kdl")), "x").unwrap(); // known full uuid -> keep
+        fs::write(dir.join("85963f9a.kdl"), "x").unwrap(); // known shortcode -> keep
+        fs::write(dir.join("3a3ae29d.kdl"), "x").unwrap(); // orphan shortcode -> remove
+        fs::write(dir.join("notes.txt"), "x").unwrap(); // wrong extension -> ignore
+
+        let keep = session_file_keys(&[uuid.to_string()]);
+        let removed = prune_dir(&dir, Some("kdl"), &keep);
+
+        assert_eq!(removed, 1);
+        assert!(dir.join(format!("{uuid}.kdl")).exists());
+        assert!(dir.join("85963f9a.kdl").exists());
+        assert!(!dir.join("3a3ae29d.kdl").exists());
+        assert!(dir.join("notes.txt").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_dir_matches_markers_without_extension() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!(
+            "csm-prune-markers-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let uuid = "85963f9a-c04e-4a05-b50d-5c32a0424114";
+        let orphan = "11111111-2222-3333-4444-555555555555";
+        fs::write(dir.join(uuid), "x").unwrap(); // known marker -> keep
+        fs::write(dir.join(orphan), "x").unwrap(); // orphan marker -> remove
+
+        let keep = session_file_keys(&[uuid.to_string()]);
+        let removed = prune_dir(&dir, None, &keep);
+
+        assert_eq!(removed, 1);
+        assert!(dir.join(uuid).exists());
+        assert!(!dir.join(orphan).exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -328,6 +328,9 @@ pub async fn run(name: &str, here: bool) -> Result<()> {
         let _ = session::Entity::delete_by_id(session_name.clone())
             .exec(&db)
             .await;
+        // Reap the layout/marker files start_zellij_session wrote before failing
+        // so a failed run never leaves an orphaned per-session file behind.
+        zellij::cleanup_session_files(&uuid);
         if created_worktree && let Err(e) = git::remove_worktree(&source_repo, &worktree) {
             eprintln!("Warning: cleanup after failed run: {e}");
         }
@@ -502,11 +505,26 @@ pub async fn rm(
 
     if targets.is_empty() {
         println!("No matching sessions to remove.");
-        return Ok(());
+    } else {
+        for session in targets {
+            remove_one(&db, &zs, &csm, session, force).await?;
+        }
     }
 
-    for session in targets {
-        remove_one(&db, &zs, &csm, session, force).await?;
+    // Sweep any per-session layout/marker files that no longer belong to a
+    // known session. This reaps files left by older csm versions (which named
+    // layouts by shortcode, so `cleanup_session_files` never matched them) and
+    // by failure paths that predate cleanup. Run against every remaining
+    // session (any status) so restorable sessions keep their files.
+    let known: Vec<String> = Session::find()
+        .all(&db)
+        .await?
+        .into_iter()
+        .map(|s| s.copilot_uuid)
+        .collect();
+    let pruned = zellij::prune_orphans(&known);
+    if pruned > 0 {
+        println!("Pruned {pruned} orphaned session file(s).");
     }
 
     Ok(())

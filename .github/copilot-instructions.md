@@ -72,8 +72,14 @@ There is no daemon or server. csm shells out to external binaries (`git`,
   invocations don't hit `SQLITE_BUSY`. Keep new DB work compatible with that.
 - Mutating commands refresh `last_used_at` (via `now_str()`), and that field
   drives list/picker ordering alongside `status_rank`.
-- Failures during session creation roll back: `run` deletes the DB row and
-  removes the worktree if startup fails. Follow this create-then-cleanup shape.
+- Failures during session creation roll back: `run` deletes the DB row, reaps
+  the layout/marker via `zellij::cleanup_session_files`, and removes the
+  worktree if startup fails. Follow this create-then-cleanup shape.
+- Orphaned per-session files are swept on `rm`: after removals, `commands::rm`
+  calls `zellij::prune_orphans` with every remaining session UUID, deleting
+  layout `.kdl` files and markers with no DB row. It matches both the full-UUID
+  and older shortcode (`<shortcode>.kdl`) filename schemes, so files that
+  `cleanup_session_files` (UUID-only) can't match are still reaped.
 - `run` has three modes: normal (new branch + worktree), non-repo (skips
   branch/worktree, runs Copilot in the cwd), and `--here` (same, but forced even
   inside a repo). If a session name is taken, `run` appends a numeric suffix
