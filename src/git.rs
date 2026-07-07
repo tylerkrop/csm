@@ -37,6 +37,19 @@ pub fn branch_exists(branch: &str, source_repo: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Run `git pull` in the given repository. Returns an error if git fails so
+/// callers can decide whether to warn or abort.
+pub fn pull(repo: &str) -> Result<()> {
+    let out = Command::new("git")
+        .args(["-C", repo, "pull"])
+        .output()
+        .context("Failed to run git pull")?;
+    if !out.status.success() {
+        bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 /// Create a git worktree. Optionally scoped to a source repository
 /// and optionally creating a new branch.
 pub fn create_worktree(

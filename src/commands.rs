@@ -29,6 +29,17 @@ fn now_str() -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Whole days elapsed since a stored `last_used_at` timestamp. Returns None if
+/// the timestamp can't be parsed.
+fn days_since(timestamp: &str) -> Option<i64> {
+    let then = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S").ok()?;
+    let secs = Utc::now()
+        .naive_utc()
+        .signed_duration_since(then)
+        .num_seconds();
+    Some(secs / 86_400)
+}
+
 /// Build the copilot launch command for a session.
 ///
 /// `run` starts a brand-new session and uses `--name=<uuid>` so the copilot
@@ -153,6 +164,7 @@ async fn start_zellij_session(
     resume: bool,
 ) -> Result<()> {
     let layout = zellij::ensure_layout()?;
+    let config = zellij::ensure_config()?;
     let injector =
         zellij::spawn_command_injector(zellij_name.to_string(), copilot_command(uuid, resume)?);
     let mut cmd = Command::new("zellij");
@@ -160,7 +172,9 @@ async fn start_zellij_session(
     // given layout file, even when the caller is already inside zellij. We
     // still pass `-s` to set the session name. `--layout` would instead try
     // to attach to an existing session and add the layout as new tabs.
-    cmd.args(["-s", zellij_name, "-n"])
+    cmd.arg("--config")
+        .arg(&config)
+        .args(["-s", zellij_name, "-n"])
         .arg(&layout)
         .current_dir(worktree);
     enter_zellij(db, session_name, zellij_name, cmd, Some(injector)).await
@@ -182,28 +196,55 @@ pub async fn run(name: &str) -> Result<()> {
             .await?;
     }
 
-    let branch = format!("{BRANCH_PREFIX}/{name}");
     let uuid = Uuid::new_v4().to_string();
-    let source_repo = git::repo_root()?;
-    let repo_name = git::repo_name(&source_repo);
     let zellij_name = display::short_uuid(&uuid);
-    let worktree_path = dir
-        .join("worktrees")
-        .join(&repo_name)
-        .join(format!("{repo_name}-{zellij_name}"));
 
-    // Defense in depth: ensure the constructed path lives under ~/.csm.
-    if !worktree_path.starts_with(&dir) {
-        bail!(
-            "Refusing to create worktree outside of {}: {}",
-            dir.display(),
-            worktree_path.display()
-        );
-    }
-    let worktree = worktree_path.to_string_lossy().to_string();
+    // When not inside a git repository, skip branch/worktree creation and run
+    // copilot directly in the current directory. `created_worktree` tracks
+    // whether csm owns the worktree, so cleanup never touches the user's dir.
+    let (branch, source_repo, worktree, created_worktree) = match git::repo_root().ok() {
+        Some(source_repo) => {
+            // On a default branch (main/master), pull latest before branching
+            // so the new worktree starts from up-to-date history.
+            if let Some(current) = git::current_branch(&source_repo)
+                && (current == "main" || current == "master")
+            {
+                eprintln!("On default branch '{current}', pulling latest changes...");
+                if let Err(e) = git::pull(&source_repo) {
+                    eprintln!("Warning: {e}");
+                }
+            }
 
-    let new_branch = !git::branch_exists(&branch, None);
-    git::create_worktree(&worktree, &branch, new_branch, None)?;
+            let branch = format!("{BRANCH_PREFIX}/{name}");
+            let repo_name = git::repo_name(&source_repo);
+            let worktree_path = dir
+                .join("worktrees")
+                .join(&repo_name)
+                .join(format!("{repo_name}-{zellij_name}"));
+
+            // Defense in depth: ensure the constructed path lives under ~/.csm.
+            if !worktree_path.starts_with(&dir) {
+                bail!(
+                    "Refusing to create worktree outside of {}: {}",
+                    dir.display(),
+                    worktree_path.display()
+                );
+            }
+            let worktree = worktree_path.to_string_lossy().to_string();
+
+            let new_branch = !git::branch_exists(&branch, None);
+            git::create_worktree(&worktree, &branch, new_branch, None)?;
+            (branch, source_repo, worktree, true)
+        }
+        None => {
+            let cwd = std::env::current_dir()
+                .context("Could not determine current directory")?
+                .to_string_lossy()
+                .to_string();
+            eprintln!("Not in a git repository; running in current directory without a worktree.");
+            (String::new(), cwd.clone(), cwd, false)
+        }
+    };
 
     let model = ActiveModel {
         name: Set(name.to_string()),
@@ -216,14 +257,20 @@ pub async fn run(name: &str) -> Result<()> {
     };
     model.insert(&db).await?;
 
-    eprintln!("Created session '{name}' (branch: {branch}, uuid: {uuid})");
+    if branch.is_empty() {
+        eprintln!("Created session '{name}' (uuid: {uuid})");
+    } else {
+        eprintln!("Created session '{name}' (branch: {branch}, uuid: {uuid})");
+    }
     let result = start_zellij_session(&db, name, &zellij_name, &uuid, &worktree, false).await;
 
     if result.is_err() {
         let _ = session::Entity::delete_by_id(name.to_string())
             .exec(&db)
             .await;
-        if let Err(e) = git::remove_worktree(&source_repo, &worktree) {
+        if created_worktree
+            && let Err(e) = git::remove_worktree(&source_repo, &worktree)
+        {
             eprintln!("Warning: cleanup after failed run: {e}");
         }
     }
@@ -328,7 +375,12 @@ pub async fn stop(names: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub async fn rm(names: &[String], force: bool, interactive: bool) -> Result<()> {
+pub async fn rm(
+    names: &[String],
+    force: bool,
+    interactive: bool,
+    older_than: Option<u64>,
+) -> Result<()> {
     let db = crate::db::connect().await?;
 
     let names: Vec<String> = if interactive {
@@ -350,68 +402,107 @@ pub async fn rm(names: &[String], force: bool, interactive: bool) -> Result<()> 
             }
         }
     } else {
-        if names.is_empty() {
-            bail!("No session names provided");
+        if names.is_empty() && older_than.is_none() {
+            bail!("No sessions specified: provide names, --interactive, or --older-than <DAYS>");
         }
         names.to_vec()
     };
 
-    if names.is_empty() {
-        println!("No sessions selected");
+    let zs = zellij::State::query();
+    let csm = csm_dir()?;
+
+    // Build a deduped list of target sessions from explicit/picked names and,
+    // if requested, all sessions inactive for at least `older_than` days.
+    let mut targets: Vec<session::Model> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for name in &names {
+        match resolve_session(&db, name).await {
+            Ok(s) => {
+                if seen.insert(s.name.clone()) {
+                    targets.push(s);
+                }
+            }
+            Err(e) => eprintln!("{e}, skipping"),
+        }
+    }
+
+    if let Some(days) = older_than {
+        let aged = Session::find()
+            .filter(Column::Status.ne(STATUS_REMOVED))
+            .all(&db)
+            .await?;
+        for s in aged {
+            if days_since(&s.last_used_at).is_some_and(|d| d >= days as i64)
+                && seen.insert(s.name.clone())
+            {
+                targets.push(s);
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        println!("No matching sessions to remove.");
         return Ok(());
     }
 
-    let zs = zellij::State::query();
+    for session in targets {
+        remove_one(&db, &zs, &csm, session, force).await?;
+    }
 
-    for name in &names {
-        let session = match resolve_session(&db, name).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{e}, skipping");
-                continue;
-            }
-        };
-        let sname = session.name.clone();
-        let zname = zellij_session_name(&session);
+    Ok(())
+}
 
-        if session.status == STATUS_REMOVED {
-            if force {
-                session::Entity::delete_by_id(sname.to_string())
-                    .exec(&db)
-                    .await?;
-                println!("Destroyed session '{sname}'");
-            } else {
-                eprintln!("Session '{sname}' is already removed, skipping (use -f to destroy)");
-            }
-            continue;
-        }
+/// Remove (or, with `force`, destroy) a single resolved session. The worktree
+/// directory is only deleted when it lives under `~/.csm` so sessions started
+/// in a plain directory (no git repo) never wipe the user's own files.
+async fn remove_one(
+    db: &DatabaseConnection,
+    zs: &zellij::State,
+    csm: &std::path::Path,
+    session: session::Model,
+    force: bool,
+) -> Result<()> {
+    let sname = session.name.clone();
+    let zname = zellij_session_name(&session);
 
-        if (zs.is_running(&zname) || zs.exists(&zname))
-            && !zellij::stop_and_cleanup(&zname)
-        {
-            eprintln!(
-                "Warning: zellij session '{zname}' did not exit within timeout; \
-                 continuing with removal."
-            );
-        }
-
-        if let Err(e) = git::remove_worktree(&session.source_repo, &session.worktree_path) {
-            eprintln!("Warning: {e}; continuing with removal of '{sname}'.");
-        }
-
+    if session.status == STATUS_REMOVED {
         if force {
             session::Entity::delete_by_id(sname.to_string())
-                .exec(&db)
+                .exec(db)
                 .await?;
             println!("Destroyed session '{sname}'");
         } else {
-            let mut active: ActiveModel = session.into();
-            active.status = Set(STATUS_REMOVED.to_string());
-            active.update(&db).await?;
-            println!("Removed session '{sname}'");
+            eprintln!("Session '{sname}' is already removed, skipping (use -f to destroy)");
         }
+        return Ok(());
     }
 
+    if (zs.is_running(&zname) || zs.exists(&zname)) && !zellij::stop_and_cleanup(&zname) {
+        eprintln!(
+            "Warning: zellij session '{zname}' did not exit within timeout; \
+             continuing with removal."
+        );
+    }
+
+    let managed_worktree = std::path::Path::new(&session.worktree_path).starts_with(csm);
+    if managed_worktree
+        && let Err(e) = git::remove_worktree(&session.source_repo, &session.worktree_path)
+    {
+        eprintln!("Warning: {e}; continuing with removal of '{sname}'.");
+    }
+
+    if force {
+        session::Entity::delete_by_id(sname.to_string())
+            .exec(db)
+            .await?;
+        println!("Destroyed session '{sname}'");
+    } else {
+        let mut active: ActiveModel = session.into();
+        active.status = Set(STATUS_REMOVED.to_string());
+        active.update(db).await?;
+        println!("Removed session '{sname}'");
+    }
     Ok(())
 }
 
@@ -696,8 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_command_rejects_invalid() {
-        // Strings that pass the *old* hex-only check but are not real UUIDs.
+    fn copilot_command_rejects_invalid() {        // Strings that pass the *old* hex-only check but are not real UUIDs.
         // This guards the security fix from regressing.
         for bad in [
             "",
@@ -716,5 +806,18 @@ mod tests {
                 "expected '{bad}' to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn days_since_computes_whole_days() {
+        let fmt = "%Y-%m-%d %H:%M:%S";
+        let now = Utc::now().naive_utc();
+        let three_days_ago = (now - chrono::Duration::days(3)).format(fmt).to_string();
+        assert_eq!(days_since(&three_days_ago), Some(3));
+
+        let now_ts = now.format(fmt).to_string();
+        assert_eq!(days_since(&now_ts), Some(0));
+
+        assert_eq!(days_since("not a timestamp"), None);
     }
 }

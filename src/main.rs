@@ -53,6 +53,9 @@ enum Commands {
         /// Pick sessions to remove from an interactive list
         #[arg(short, long, conflicts_with = "names")]
         interactive: bool,
+        /// Also remove all sessions inactive for at least this many days
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
     },
     /// List sessions (-a includes removed)
     #[command(alias = "ls", alias = "ps")]
@@ -85,8 +88,8 @@ async fn main() -> Result<()> {
         Commands::Start { name } => commands::start(&name).await,
         Commands::Attach { name } => commands::attach(&name).await,
         Commands::Stop { names } => commands::stop(&names).await,
-        Commands::Remove { names, force, interactive } => {
-            commands::rm(&names, force, interactive).await
+        Commands::Remove { names, force, interactive, older_than } => {
+            commands::rm(&names, force, interactive, older_than).await
         }
         Commands::List { all } => commands::list(all).await,
         Commands::Restore { name } => commands::restore(&name).await,

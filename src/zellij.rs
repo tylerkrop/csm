@@ -31,6 +31,13 @@ const LAYOUT_KDL: &str = r#"layout {
 }
 "#;
 
+/// Zellij configuration written to `~/.csm/config.kdl` and passed to every
+/// freshly-launched session via `--config`. Uses the simplified (ASCII) UI
+/// variant and removes the frame/border drawn around panes.
+const CONFIG_KDL: &str = r#"simplified_ui true
+pane_frames false
+"#;
+
 /// Write the csm zellij layout to `~/.csm/layout.kdl` (overwriting any existing
 /// file so updates to `LAYOUT_KDL` take effect on the next launch) and return
 /// its path so it can be passed to `zellij --layout`.
@@ -41,6 +48,20 @@ pub fn ensure_layout() -> Result<PathBuf> {
         .with_context(|| format!("Failed to create {}", dir.display()))?;
     let path = dir.join("layout.kdl");
     std::fs::write(&path, LAYOUT_KDL)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Write the csm zellij config to `~/.csm/config.kdl` (overwriting any existing
+/// file so updates to `CONFIG_KDL` take effect on the next launch) and return
+/// its path so it can be passed to `zellij --config`.
+pub fn ensure_config() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let dir = home.join(".csm");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    let path = dir.join("config.kdl");
+    std::fs::write(&path, CONFIG_KDL)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(path)
 }
