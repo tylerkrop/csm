@@ -96,8 +96,7 @@ pub fn ensure_layout(uuid: &str, launcher: &Path, include_git: bool) -> Result<P
     validate_uuid(uuid)?;
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let dir = home.join(".csm").join("layouts");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     let path = dir.join(format!("{uuid}.kdl"));
     let launcher = launcher.to_string_lossy();
     std::fs::write(&path, layout_kdl(&launcher, uuid, include_git))
@@ -112,8 +111,7 @@ pub fn ensure_layout(uuid: &str, launcher: &Path, include_git: bool) -> Result<P
 pub fn ensure_launcher() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let dir = home.join(".csm");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     let path = dir.join("launch-copilot.sh");
     std::fs::write(&path, LAUNCHER_SCRIPT)
         .with_context(|| format!("Failed to write {}", path.display()))?;
@@ -139,8 +137,7 @@ pub fn ensure_marker(uuid: &str) -> Result<()> {
     validate_uuid(uuid)?;
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let dir = home.join(".csm").join("markers");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     let path = dir.join(uuid);
     if !path.exists() {
         std::fs::File::create(&path)
@@ -169,8 +166,7 @@ pub fn cleanup_session_files(uuid: &str) {
 pub fn ensure_config() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let dir = home.join(".csm");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     let path = dir.join("config.kdl");
     std::fs::write(&path, CONFIG_KDL)
         .with_context(|| format!("Failed to write {}", path.display()))?;
@@ -219,9 +215,7 @@ impl State {
 
 /// Kill a running zellij session.
 pub fn stop(name: &str) {
-    let _ = Command::new("zellij")
-        .args(["kill-session", name])
-        .output();
+    let _ = Command::new("zellij").args(["kill-session", name]).output();
 }
 
 /// Delete a dead/exited zellij session.
@@ -306,15 +300,15 @@ fed09876 [Created 1h ago]\n";
     fn parse_skips_blank_lines() {
         let out = "abc\n\n   \ndef\n";
         let parsed = parse_list_sessions(out);
-        assert_eq!(parsed, vec![("abc".to_string(), true), ("def".to_string(), true)]);
+        assert_eq!(
+            parsed,
+            vec![("abc".to_string(), true), ("def".to_string(), true)]
+        );
     }
 
     #[test]
     fn state_helpers() {
-        let s = State::from_sessions(vec![
-            ("a".to_string(), true),
-            ("b".to_string(), false),
-        ]);
+        let s = State::from_sessions(vec![("a".to_string(), true), ("b".to_string(), false)]);
         assert!(s.is_running("a"));
         assert!(!s.is_running("b"));
         assert!(s.exists("a"));

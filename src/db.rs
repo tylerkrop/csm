@@ -11,7 +11,9 @@ pub async fn connect() -> Result<DatabaseConnection> {
 
     let url = format!(
         "sqlite:{}?mode=rwc",
-        db_path.to_str().context("Database path contains invalid UTF-8")?
+        db_path
+            .to_str()
+            .context("Database path contains invalid UTF-8")?
     );
     let db = Database::connect(&url)
         .await

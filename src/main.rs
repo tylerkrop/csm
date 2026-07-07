@@ -10,7 +10,10 @@ mod interactive;
 mod zellij;
 
 #[derive(Parser)]
-#[command(name = "csm", about = "Copilot Session Manager – manage Copilot sessions in Zellij")]
+#[command(
+    name = "csm",
+    about = "Copilot Session Manager – manage Copilot sessions in Zellij"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -92,9 +95,12 @@ async fn main() -> Result<()> {
         Commands::Start { name } => commands::start(&name).await,
         Commands::Attach { name } => commands::attach(&name).await,
         Commands::Stop { names } => commands::stop(&names).await,
-        Commands::Remove { names, force, interactive, older_than } => {
-            commands::rm(&names, force, interactive, older_than).await
-        }
+        Commands::Remove {
+            names,
+            force,
+            interactive,
+            older_than,
+        } => commands::rm(&names, force, interactive, older_than).await,
         Commands::List { all } => commands::list(all).await,
         Commands::Restore { name } => commands::restore(&name).await,
         Commands::Rename { old, new } => commands::rename(&old, &new).await,

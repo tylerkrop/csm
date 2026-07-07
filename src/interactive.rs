@@ -142,9 +142,7 @@ impl PickerState {
                 .unwrap_or(0),
             None => 0,
         };
-        self.cursor = self
-            .cursor
-            .min(self.filtered.len().saturating_sub(1));
+        self.cursor = self.cursor.min(self.filtered.len().saturating_sub(1));
         self.offset = 0;
     }
 
@@ -367,7 +365,12 @@ fn render(
     rows: usize,
     viewport: usize,
 ) -> Result<()> {
-    queue!(stdout, ResetColor, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+    queue!(
+        stdout,
+        ResetColor,
+        cursor::MoveTo(0, 0),
+        Clear(ClearType::All)
+    )?;
 
     // Title row.
     queue!(
@@ -404,7 +407,11 @@ fn render(
         for (vis_row, (filt_idx, &item_idx)) in visible.enumerate() {
             let y = 1u16 + vis_row as u16;
             let is_cursor = filt_idx == state.cursor;
-            let mark = if state.selected[item_idx] { "[x]" } else { "[ ]" };
+            let mark = if state.selected[item_idx] {
+                "[x]"
+            } else {
+                "[ ]"
+            };
             let arrow = if is_cursor { ">" } else { " " };
             let display = &state.items[item_idx].display;
             let prefix = format!("{arrow} {mark} ");
@@ -420,12 +427,7 @@ fn render(
                 // colored fields. Foreground colors are preserved.
                 let raw = format!("{prefix}{body}{}", " ".repeat(pad));
                 let highlighted = apply_background(&raw, HIGHLIGHT_BG);
-                queue!(
-                    stdout,
-                    Print(HIGHLIGHT_BG),
-                    Print(highlighted),
-                    ResetColor,
-                )?;
+                queue!(stdout, Print(HIGHLIGHT_BG), Print(highlighted), ResetColor,)?;
             } else {
                 queue!(stdout, Print(prefix), Print(body), ResetColor)?;
                 if pad > 0 {
@@ -505,7 +507,9 @@ fn render_footer(
         Mode::Confirm => {
             let count = pending_remove_count(state);
             let noun = if count == 1 { "session" } else { "sessions" };
-            let prompt = format!("Remove {count} {noun}? Press [y] to confirm, any other key to go back, ctrl-c to cancel");
+            let prompt = format!(
+                "Remove {count} {noun}? Press [y] to confirm, any other key to go back, ctrl-c to cancel"
+            );
             queue!(
                 stdout,
                 SetAttribute(Attribute::Bold),
@@ -757,9 +761,7 @@ mod tests {
 
     #[test]
     fn ensure_cursor_visible_scrolls_offset() {
-        let mut s = build(&[
-            ("a", ""), ("b", ""), ("c", ""), ("d", ""), ("e", ""),
-        ]);
+        let mut s = build(&[("a", ""), ("b", ""), ("c", ""), ("d", ""), ("e", "")]);
         // Viewport of 2: cursor at 4 should set offset to 3.
         s.cursor = 4;
         s.ensure_cursor_visible(2);
@@ -808,7 +810,10 @@ mod tests {
         let bg = "\x1b[100m";
         let s = "\x1b[31mhi\x1b[0m there \x1b[32my\x1b[0m";
         let out = apply_background(s, bg);
-        assert_eq!(out, "\x1b[31mhi\x1b[0m\x1b[100m there \x1b[32my\x1b[0m\x1b[100m");
+        assert_eq!(
+            out,
+            "\x1b[31mhi\x1b[0m\x1b[100m there \x1b[32my\x1b[0m\x1b[100m"
+        );
     }
 
     #[test]
@@ -983,10 +988,7 @@ mod tests {
 
     #[test]
     fn hidden_selections_persist_across_toggle() {
-        let items = vec![
-            item("a", "alpha"),
-            hidden_item("b", "bravo"),
-        ];
+        let items = vec![item("a", "alpha"), hidden_item("b", "bravo")];
         let mut s = PickerState::new(items, "test".into());
         s.toggle_show_hidden();
         s.cursor = 1; // "b"

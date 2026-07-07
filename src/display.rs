@@ -27,7 +27,10 @@ pub fn relative_time(timestamp: &str) -> String {
     let Ok(then) = NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S") else {
         return timestamp.to_string();
     };
-    let secs = Utc::now().naive_utc().signed_duration_since(then).num_seconds();
+    let secs = Utc::now()
+        .naive_utc()
+        .signed_duration_since(then)
+        .num_seconds();
     if secs < 60 {
         "now".to_string()
     } else if secs < 3600 {
@@ -142,7 +145,10 @@ mod tests {
 
     #[test]
     fn short_uuid_returns_8_hex_chars() {
-        assert_eq!(short_uuid("abcdef01-2345-6789-abcd-ef0123456789"), "abcdef01");
+        assert_eq!(
+            short_uuid("abcdef01-2345-6789-abcd-ef0123456789"),
+            "abcdef01"
+        );
         // Shorter input shouldn't panic
         assert_eq!(short_uuid("abc"), "abc");
         assert_eq!(short_uuid(""), "");
@@ -150,7 +156,10 @@ mod tests {
 
     #[test]
     fn shortest_unique_prefixes_basic() {
-        let ids: Vec<String> = ["abcd", "abef", "wxyz"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = ["abcd", "abef", "wxyz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(shortest_unique_prefixes(&ids), vec![3, 3, 1]);
     }
 
@@ -186,12 +195,11 @@ mod tests {
         // Visible IDs look unambiguous at len 1 ("a" vs "w"), but the hidden
         // entry "abff" in the universe forces "abcd" to need a longer prefix.
         let visible = vec!["abcd".to_string(), "wxyz".to_string()];
-        let universe = vec![
-            "abcd".to_string(),
-            "abff".to_string(),
-            "wxyz".to_string(),
-        ];
-        assert_eq!(shortest_unique_prefixes_within(&visible, &universe), vec![3, 1]);
+        let universe = vec!["abcd".to_string(), "abff".to_string(), "wxyz".to_string()];
+        assert_eq!(
+            shortest_unique_prefixes_within(&visible, &universe),
+            vec![3, 1]
+        );
     }
 
     #[test]

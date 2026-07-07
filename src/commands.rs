@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, TransactionTrait,
+};
 use uuid::Uuid;
 
 use crate::display;
@@ -325,9 +328,7 @@ pub async fn run(name: &str, here: bool) -> Result<()> {
         let _ = session::Entity::delete_by_id(session_name.clone())
             .exec(&db)
             .await;
-        if created_worktree
-            && let Err(e) = git::remove_worktree(&source_repo, &worktree)
-        {
+        if created_worktree && let Err(e) = git::remove_worktree(&source_repo, &worktree) {
             eprintln!("Warning: cleanup after failed run: {e}");
         }
     }
@@ -572,9 +573,7 @@ async fn remove_one(
 /// `a` keybind can reveal them on demand. This mirrors `csm ls -a`. Removed
 /// sessions only have an effect when combined with `-f`, since `rm` without
 /// `-f` skips already-removed entries with a warning (see `rm` above).
-async fn interactive_remove_candidates(
-    db: &DatabaseConnection,
-) -> Result<Vec<interactive::Item>> {
+async fn interactive_remove_candidates(db: &DatabaseConnection) -> Result<Vec<interactive::Item>> {
     let sessions = Session::find()
         .order_by_desc(Column::LastUsedAt)
         .all(db)
@@ -627,8 +626,7 @@ async fn interactive_remove_candidates(
             let branch = if s.status == STATUS_REMOVED {
                 s.branch.clone()
             } else {
-                git::current_branch(&s.worktree_path)
-                    .unwrap_or_else(|| s.branch.clone())
+                git::current_branch(&s.worktree_path).unwrap_or_else(|| s.branch.clone())
             };
             let display_line = display::format_session_line(
                 &shortcode,
@@ -639,10 +637,7 @@ async fn interactive_remove_candidates(
                 &s.last_used_at,
                 true,
             );
-            let search_text = format!(
-                "{} {} {} {} {}",
-                s.name, repo, branch, status, hex_ids[i]
-            );
+            let search_text = format!("{} {} {} {} {}", s.name, repo, branch, status, hex_ids[i]);
             interactive::Item {
                 key: s.name.clone(),
                 display: display_line,
@@ -713,8 +708,7 @@ pub async fn list(show_all: bool) -> Result<()> {
         let shortcode = display::format_shortcode(&hex_ids[i], unique_lens[i], color);
         let repo = git::repo_name(&s.source_repo);
         let branch = if s.status != STATUS_REMOVED {
-            git::current_branch(&s.worktree_path)
-                .unwrap_or_else(|| s.branch.clone())
+            git::current_branch(&s.worktree_path).unwrap_or_else(|| s.branch.clone())
         } else {
             s.branch.clone()
         };
@@ -750,7 +744,12 @@ pub async fn restore(name: &str) -> Result<()> {
         bail!("Branch '{}' no longer exists", session.branch);
     }
 
-    git::create_worktree(&session.worktree_path, &session.branch, false, Some(&session.source_repo))?;
+    git::create_worktree(
+        &session.worktree_path,
+        &session.branch,
+        false,
+        Some(&session.source_repo),
+    )?;
 
     let uuid = session.copilot_uuid.clone();
     let worktree = session.worktree_path.clone();
@@ -802,7 +801,11 @@ pub async fn rename(old: &str, new_name: &str) -> Result<()> {
     txn.commit().await?;
 
     let zs = zellij::State::query();
-    let running = if zs.is_running(&zname) { " (still running)" } else { "" };
+    let running = if zs.is_running(&zname) {
+        " (still running)"
+    } else {
+        ""
+    };
     println!("Renamed session '{old_name}' → '{new_name}'{running}");
     Ok(())
 }
@@ -827,7 +830,10 @@ mod tests {
     #[test]
     fn validate_name_rejects_special_chars() {
         for bad in ["a b", "a/b", "a.b", "a\\b", "a;b", "a$b"] {
-            assert!(validate_name(bad).is_err(), "expected '{bad}' to be rejected");
+            assert!(
+                validate_name(bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
         }
     }
 

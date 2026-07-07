@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Get the root directory of the current git repository.
 pub fn repo_root() -> Result<String> {
@@ -56,7 +56,10 @@ pub fn pull(repo: &str) -> Result<()> {
         .output()
         .context("Failed to run git pull")?;
     if !out.status.success() {
-        bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "git pull failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
