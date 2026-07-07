@@ -40,23 +40,6 @@ fn days_since(timestamp: &str) -> Option<i64> {
     Some(secs / 86_400)
 }
 
-/// Build the copilot launch command for a session.
-///
-/// `run` starts a brand-new session and uses `--name=<uuid>` so the copilot
-/// session is tagged with our stable UUID. Restarting an existing session
-/// (`start`/`restore`) instead passes `--resume=<uuid>`, which matches that
-/// session by name (exact, case-insensitive) and resumes its context rather
-/// than spawning a fresh session that merely shares the same name.
-fn copilot_command(uuid: &str, resume: bool) -> Result<String> {
-    // Strict UUID parsing (defense in depth): even though we generate UUIDs
-    // internally, this string ends up being typed into a zellij pane, so we
-    // never want to allow shell metacharacters or other surprises through if
-    // the database is ever corrupted or hand-edited.
-    Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
-    let flag = if resume { "resume" } else { "name" };
-    Ok(format!("copilot --yolo --autopilot --{flag}={uuid}"))
-}
-
 /// The zellij session name is the 8-char hex prefix of the copilot UUID.
 fn zellij_session_name(session: &session::Model) -> String {
     display::short_uuid(&session.copilot_uuid)
@@ -134,9 +117,6 @@ async fn resolve_session(db: &DatabaseConnection, query: &str) -> Result<session
 }
 
 /// Run the zellij client, then update last_used_at when the user detaches.
-/// Aborts and joins the command injector (if any) before returning, so that
-/// callers can safely run cleanup after this function returns without racing
-/// the injector task.
 /// If the user quit zellij (Ctrl+q), cleans up the exited session so it
 /// shows as "stopped" rather than "exited" in `csm ls`.
 async fn enter_zellij(
@@ -144,21 +124,8 @@ async fn enter_zellij(
     session_name: &str,
     zellij_name: &str,
     mut cmd: Command,
-    injector: Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
-    let result = cmd.status().context("Failed to run zellij");
-
-    // Always tear down the injector before returning so that no background
-    // task can race with caller-side cleanup (e.g. removing the worktree
-    // after a failed run).
-    if let Some(handle) = injector {
-        handle.abort();
-        let _ = handle.await;
-    }
-
-    if result.is_err() {
-        return result.map(|_| ());
-    }
+    cmd.status().context("Failed to run zellij")?;
 
     // User detached or quit — update last_used_at
     if let Some(session) = Session::find_by_id(session_name).one(db).await? {
@@ -182,11 +149,15 @@ async fn enter_zellij(
     Ok(())
 }
 
-/// Spawn the copilot injector and run the zellij client in a fresh session.
-/// Used by `run`, `start`, and `restore`, which all share the same startup
-/// shape (inject the copilot command, then attach). Pass `resume = false` for
-/// a brand-new session (`run`) and `resume = true` when relaunching an
-/// existing session (`start`/`restore`) so copilot resumes its context.
+/// Launch a fresh zellij session whose `ai` tab runs the copilot launcher.
+/// Used by `run`, `start`, and `restore`, which share the same startup shape.
+/// The launcher itself picks `copilot --name` (first launch) vs
+/// `copilot --resume` (subsequent launches) via a per-session marker, so csm no
+/// longer types the command into the pane. Pass `resume = true` when relaunching
+/// an existing session (`start`/`restore`) so the marker is ensured up front and
+/// the launcher resumes even for sessions created before the launcher existed;
+/// pass `resume = false` for a brand-new session (`run`), letting the launcher
+/// create the marker on its first `--name` launch.
 async fn start_zellij_session(
     db: &DatabaseConnection,
     session_name: &str,
@@ -196,10 +167,12 @@ async fn start_zellij_session(
     resume: bool,
     include_git: bool,
 ) -> Result<()> {
-    let layout = zellij::ensure_layout(include_git)?;
+    let launcher = zellij::ensure_launcher()?;
+    let layout = zellij::ensure_layout(uuid, &launcher, include_git)?;
     let config = zellij::ensure_config()?;
-    let injector =
-        zellij::spawn_command_injector(zellij_name.to_string(), copilot_command(uuid, resume)?);
+    if resume {
+        zellij::ensure_marker(uuid)?;
+    }
     let mut cmd = Command::new("zellij");
     // `-n` (--new-session-with-layout) always creates a new session from the
     // given layout file, even when the caller is already inside zellij. We
@@ -210,7 +183,7 @@ async fn start_zellij_session(
         .args(["-s", zellij_name, "-n"])
         .arg(&layout)
         .current_dir(worktree);
-    enter_zellij(db, session_name, zellij_name, cmd, Some(injector)).await
+    enter_zellij(db, session_name, zellij_name, cmd).await
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -412,7 +385,7 @@ pub async fn attach(name: &str) -> Result<()> {
 
     let mut cmd = Command::new("zellij");
     cmd.args(["attach", zname.as_str()]);
-    enter_zellij(&db, &sname, &zname, cmd, None).await
+    enter_zellij(&db, &sname, &zname, cmd).await
 }
 
 pub async fn stop(names: &[String]) -> Result<()> {
@@ -553,6 +526,7 @@ async fn remove_one(
 
     if session.status == STATUS_REMOVED {
         if force {
+            zellij::cleanup_session_files(&session.copilot_uuid);
             session::Entity::delete_by_id(sname.to_string())
                 .exec(db)
                 .await?;
@@ -578,6 +552,7 @@ async fn remove_one(
     }
 
     if force {
+        zellij::cleanup_session_files(&session.copilot_uuid);
         session::Entity::delete_by_id(sname.to_string())
             .exec(db)
             .await?;
@@ -853,44 +828,6 @@ mod tests {
     fn validate_name_rejects_special_chars() {
         for bad in ["a b", "a/b", "a.b", "a\\b", "a;b", "a$b"] {
             assert!(validate_name(bad).is_err(), "expected '{bad}' to be rejected");
-        }
-    }
-
-    #[test]
-    fn copilot_command_new_session_uses_name() {
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let cmd = copilot_command(&uuid, false).expect("valid uuid");
-        assert!(cmd.contains(&uuid));
-        assert!(cmd.starts_with("copilot --yolo --autopilot --name="));
-    }
-
-    #[test]
-    fn copilot_command_restart_uses_resume() {
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let cmd = copilot_command(&uuid, true).expect("valid uuid");
-        assert!(cmd.contains(&uuid));
-        assert!(cmd.starts_with("copilot --yolo --autopilot --resume="));
-    }
-
-    #[test]
-    fn copilot_command_rejects_invalid() {        // Strings that pass the *old* hex-only check but are not real UUIDs.
-        // This guards the security fix from regressing.
-        for bad in [
-            "",
-            "----",
-            "deadbeef",
-            "; rm -rf / #",
-            "12345678-1234-1234-1234-12345678", // too short
-            "not-a-uuid-at-all-really-no",
-        ] {
-            assert!(
-                copilot_command(bad, false).is_err(),
-                "expected '{bad}' to be rejected"
-            );
-            assert!(
-                copilot_command(bad, true).is_err(),
-                "expected '{bad}' to be rejected"
-            );
         }
     }
 

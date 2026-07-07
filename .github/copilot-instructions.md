@@ -35,10 +35,10 @@ subcommand in `commands.rs`, which orchestrates four lower-level modules.
   is the single SeaORM entity (`Model`/`ActiveModel`) for the `sessions` table.
 - `git.rs` wraps `git` worktree/branch operations via `std::process::Command`.
 - `zellij.rs` wraps the `zellij` CLI: query session state, start/kill/cleanup
-  sessions, write the layout (`layout.kdl`, or `layout-nogit.kdl` when there is
-  no Git repo) and config (`config.kdl`), and inject the Copilot command into a
-  pane. The layout has named tabs: `ai` (focused), `git` (gitui, omitted with
-  no repo), and `edit` (nvim).
+  sessions, write the per-session layout (`~/.csm/layouts/<uuid>.kdl`, git vs
+  no-git variants), the shared config (`config.kdl`), and the copilot launcher
+  script (`launch-copilot.sh`). The layout has named tabs: `ai` (focused, runs
+  the launcher), `git` (gitui, omitted with no repo), and `edit` (nvim).
 - `display.rs` is pure formatting: shortcodes, colors, relative times, status
   ranking. No I/O side effects beyond reading whether stdout is a TTY.
 - `interactive.rs` is a self-contained `crossterm` fullscreen multi-select
@@ -57,15 +57,17 @@ There is no daemon or server. csm shells out to external binaries (`git`,
   exact name OR a unique UUID-shortcode prefix. Reuse this helper; do not look
   sessions up by name directly in new commands.
 - Git branches are always prefixed with `tylerkrop/` (`BRANCH_PREFIX`).
-- All persistent state lives under `~/.csm/`: `sessions.db`, `layout.kdl`, and
+- All persistent state lives under `~/.csm/`: `sessions.db`, `config.kdl`,
+  `launch-copilot.sh`, `layouts/<uuid>.kdl`, `markers/<uuid>`, and
   `worktrees/<repo>/<repo>-<shortcode>/`.
 - Two status vocabularies: the DB stores only `active`/`removed`
   (`STATUS_ACTIVE`/`STATUS_REMOVED`); the user-facing status
   (running/exited/stopped/removed) is derived at display time by querying live
   Zellij state via `zellij::State`. Don't persist the display statuses.
-- Defense-in-depth checks are intentional: UUIDs are re-parsed before being
-  typed into a pane (`copilot_command`), and constructed worktree paths are
-  verified to start with `~/.csm` before use. Preserve these guards.
+- Defense-in-depth checks are intentional: UUIDs are re-parsed
+  (`zellij::validate_uuid`) before being written into a layout file or marker
+  path, and constructed worktree paths are verified to start with `~/.csm`
+  before use. Preserve these guards.
 - SQLite is opened in WAL mode with a 5s busy timeout so concurrent `csm`
   invocations don't hit `SQLITE_BUSY`. Keep new DB work compatible with that.
 - Mutating commands refresh `last_used_at` (via `now_str()`), and that field
@@ -76,7 +78,13 @@ There is no daemon or server. csm shells out to external binaries (`git`,
   branch/worktree, runs Copilot in the cwd), and `--here` (same, but forced even
   inside a repo). If a session name is taken, `run` appends a numeric suffix
   (`<name>-2`, …) rather than erroring; the branch keeps the requested name.
-- New sessions launch `copilot --name=<uuid>`; `start`/`restore` use
-  `copilot --resume=<uuid>` to restore prior conversation context. Preserve this
-  new-vs-resume distinction when changing session startup.
+- The `ai` tab runs `~/.csm/launch-copilot.sh <uuid>` as a zellij command pane
+  (not an injected keystroke), so zellij owns copilot and offers Enter-to-rerun
+  on exit, like the `git`/`edit` tabs. The launcher self-selects `copilot --name`
+  on a session's first launch and `copilot --resume` afterward, keyed by a marker
+  file (`~/.csm/markers/<uuid>`) written before the first `--name` launch so a
+  killed session never spawns a duplicate. `run` starts a session with
+  `resume=false` (let the launcher create the marker); `start`/`restore` pass
+  `resume=true`, which calls `zellij::ensure_marker` up front so pre-existing
+  sessions resume. Preserve this marker contract when changing session startup.
 - Source uses `// ── Section ──` comment banners to group helpers vs commands.

@@ -1,19 +1,24 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
 
-/// Build the zellij layout KDL. The `include_git` flag controls whether the
-/// "git" tab (which runs `gitui`) is present: `gitui` fails outside a git
-/// repository, so callers omit that tab for sessions started in a non-git
-/// directory.
+/// Build the zellij layout KDL for a session. The `ai` tab runs the csm copilot
+/// launcher (`launcher`) as a command pane with the session `uuid` as its
+/// argument, so zellij owns the copilot process just like it owns `gitui`/`nvim`
+/// in the other tabs: when copilot exits, the pane shows the standard "press
+/// Enter to re-run" prompt, and re-running resumes the session (the launcher
+/// picks `--resume` after the first launch).
+///
+/// The `include_git` flag controls whether the "git" tab (which runs `gitui`)
+/// is present: `gitui` fails outside a git repository, so callers omit that tab
+/// for sessions started in a non-git directory.
 ///
 /// Defines up to three named tabs:
-/// - "ai" — default shell, focused on launch so the copilot injector types
-///   the resume command into this pane.
+/// - "ai" — runs the copilot launcher, focused on launch.
 /// - "git" — runs `gitui` in the worktree (only when `include_git`).
 /// - "edit" — runs `nvim` in the worktree.
-fn layout_kdl(include_git: bool) -> String {
+fn layout_kdl(launcher: &str, uuid: &str, include_git: bool) -> String {
     let git_tab = if include_git {
         "    tab name=\"git\" {\n        pane command=\"gitui\"\n    }\n"
     } else {
@@ -31,7 +36,9 @@ fn layout_kdl(include_git: bool) -> String {
         }}
     }}
     tab name="ai" focus=true {{
-        pane
+        pane command="{launcher}" {{
+            args "{uuid}"
+        }}
     }}
 {git_tab}    tab name="edit" {{
         pane command="nvim"
@@ -41,6 +48,37 @@ fn layout_kdl(include_git: bool) -> String {
     )
 }
 
+/// Shell launcher for the copilot pane, written to `~/.csm/launch-copilot.sh`
+/// and invoked as `launch-copilot.sh <uuid>`.
+///
+/// It records a per-session marker under `~/.csm/markers/<uuid>` the first time
+/// it runs and uses that marker to choose between creating (`--name`) and
+/// resuming (`--resume`) the copilot session. This lets a static zellij command
+/// pane be re-run (Enter) after copilot exits and resume the same conversation
+/// instead of spawning a duplicate named session. The marker is written *before*
+/// the first `--name` launch, so a session killed before copilot exits cleanly
+/// still resumes (never duplicates) on its next launch.
+const LAUNCHER_SCRIPT: &str = r#"#!/bin/sh
+set -u
+uuid="$1"
+marker="${HOME}/.csm/markers/${uuid}"
+if [ -f "$marker" ]; then
+    exec copilot --yolo --autopilot --resume="$uuid"
+fi
+mkdir -p "${HOME}/.csm/markers"
+: > "$marker"
+exec copilot --yolo --autopilot --name="$uuid"
+"#;
+
+/// Re-parse a UUID before it is embedded in a layout file or marker path.
+/// Defense in depth: these strings come from the database and are written into
+/// files consumed by zellij and a shell script, so nothing that isn't a
+/// well-formed UUID is ever allowed through.
+fn validate_uuid(uuid: &str) -> Result<()> {
+    uuid::Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
+    Ok(())
+}
+
 /// Zellij configuration written to `~/.csm/config.kdl` and passed to every
 /// freshly-launched session via `--config`. Uses the simplified (ASCII) UI
 /// variant and removes the frame/border drawn around panes.
@@ -48,21 +86,81 @@ const CONFIG_KDL: &str = r#"simplified_ui true
 pane_frames false
 "#;
 
-/// Write the csm zellij layout to `~/.csm/` (overwriting any existing file so
-/// updates take effect on the next launch) and return its path so it can be
-/// passed to `zellij -n`. `include_git` selects the git-tab variant; each
-/// variant is written to a distinct file so concurrent launches with different
-/// settings don't clobber each other's layout.
-pub fn ensure_layout(include_git: bool) -> Result<PathBuf> {
+/// Write the per-session zellij layout to `~/.csm/layouts/<uuid>.kdl` and return
+/// its path so it can be passed to `zellij -n`. Because the layout embeds the
+/// session `uuid` (as the launcher argument), each session gets its own file
+/// rather than a shared one: this keeps concurrent launches from clobbering
+/// each other and lets the `ai` pane target the right copilot session.
+/// `include_git` selects the git-tab variant.
+pub fn ensure_layout(uuid: &str, launcher: &Path, include_git: bool) -> Result<PathBuf> {
+    validate_uuid(uuid)?;
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let dir = home.join(".csm").join("layouts");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    let path = dir.join(format!("{uuid}.kdl"));
+    let launcher = launcher.to_string_lossy();
+    std::fs::write(&path, layout_kdl(&launcher, uuid, include_git))
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Write the copilot launcher script to `~/.csm/launch-copilot.sh` (overwriting
+/// any existing copy so updates to `LAUNCHER_SCRIPT` take effect) with the
+/// executable bit set, and return its path so it can be embedded in the layout
+/// as the `ai` pane command.
+pub fn ensure_launcher() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let dir = home.join(".csm");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create {}", dir.display()))?;
-    let file = if include_git { "layout.kdl" } else { "layout-nogit.kdl" };
-    let path = dir.join(file);
-    std::fs::write(&path, layout_kdl(include_git))
+    let path = dir.join("launch-copilot.sh");
+    std::fs::write(&path, LAUNCHER_SCRIPT)
         .with_context(|| format!("Failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)
+            .with_context(|| format!("Failed to stat {}", path.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms)
+            .with_context(|| format!("Failed to chmod {}", path.display()))?;
+    }
     Ok(path)
+}
+
+/// Ensure the launcher marker for `uuid` exists so its next launch resumes
+/// (`--resume`) rather than creates (`--name`) the copilot session. Called when
+/// relaunching an existing session (`start`/`restore`), including sessions
+/// created before the launcher existed, so they never spawn a duplicate named
+/// session.
+pub fn ensure_marker(uuid: &str) -> Result<()> {
+    validate_uuid(uuid)?;
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let dir = home.join(".csm").join("markers");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    let path = dir.join(uuid);
+    if !path.exists() {
+        std::fs::File::create(&path)
+            .with_context(|| format!("Failed to create {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Best-effort removal of a session's launcher marker and per-session layout
+/// file. Called when a session is permanently destroyed (`remove -f`); the uuid
+/// is never reused, so these files would otherwise linger under `~/.csm`.
+pub fn cleanup_session_files(uuid: &str) {
+    if validate_uuid(uuid).is_err() {
+        return;
+    }
+    if let Some(home) = dirs::home_dir() {
+        let base = home.join(".csm");
+        let _ = std::fs::remove_file(base.join("markers").join(uuid));
+        let _ = std::fs::remove_file(base.join("layouts").join(format!("{uuid}.kdl")));
+    }
 }
 
 /// Write the csm zellij config to `~/.csm/config.kdl` (overwriting any existing
@@ -163,31 +261,6 @@ fn session_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Wait for a zellij session to appear, then type a command into its first pane.
-/// Spawns as a tokio task so it runs concurrently with the zellij client.
-/// Returns a handle that can be aborted if zellij fails to start.
-pub fn spawn_command_injector(session_name: String, command: String) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // Poll until the session exists (100ms intervals, 30s timeout)
-        for _ in 0..300 {
-            if session_exists(&session_name) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        // Small delay for the shell to initialize
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        let _ = Command::new("zellij")
-            .args(["-s", &session_name, "action", "write-chars", &command])
-            .output();
-        let _ = Command::new("zellij")
-            .args(["-s", &session_name, "action", "write", "10"])
-            .output();
-    })
-}
-
 /// Parse the output of `zellij list-sessions -n`. Each non-empty line begins
 /// with a session name; the line is treated as "running" unless it contains
 /// the literal `EXITED` marker. Exposed as a free function so it can be unit
@@ -254,15 +327,52 @@ fed09876 [Created 1h ago]\n";
 
     #[test]
     fn layout_includes_git_tab_conditionally() {
-        let with_git = layout_kdl(true);
+        let launcher = "/home/u/.csm/launch-copilot.sh";
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        let with_git = layout_kdl(launcher, uuid, true);
         assert!(with_git.contains("command=\"gitui\""));
         assert!(with_git.contains("name=\"git\""));
         assert!(with_git.contains("command=\"nvim\""));
 
-        let without_git = layout_kdl(false);
+        let without_git = layout_kdl(launcher, uuid, false);
         assert!(!without_git.contains("gitui"));
         assert!(!without_git.contains("name=\"git\""));
         assert!(without_git.contains("command=\"nvim\""));
         assert!(without_git.contains("name=\"ai\""));
+    }
+
+    #[test]
+    fn ai_tab_runs_launcher_with_uuid() {
+        let launcher = "/home/u/.csm/launch-copilot.sh";
+        let uuid = "abcdef01-2345-6789-abcd-ef0123456789";
+        let layout = layout_kdl(launcher, uuid, true);
+        assert!(layout.contains(&format!("pane command=\"{launcher}\"")));
+        assert!(layout.contains(&format!("args \"{uuid}\"")));
+        assert!(layout.contains("name=\"ai\" focus=true"));
+    }
+
+    #[test]
+    fn launcher_script_selects_name_then_resume() {
+        assert!(LAUNCHER_SCRIPT.contains("--name=\"$uuid\""));
+        assert!(LAUNCHER_SCRIPT.contains("--resume=\"$uuid\""));
+        assert!(LAUNCHER_SCRIPT.contains("markers/${uuid}"));
+    }
+
+    #[test]
+    fn validate_uuid_rejects_non_uuid() {
+        for bad in [
+            "",
+            "----",
+            "deadbeef",
+            "; rm -rf / #",
+            "12345678-1234-1234-1234-12345678",
+            "not-a-uuid-at-all-really-no",
+        ] {
+            assert!(
+                validate_uuid(bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
+        assert!(validate_uuid("abcdef01-2345-6789-abcd-ef0123456789").is_ok());
     }
 }
