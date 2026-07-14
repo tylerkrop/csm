@@ -49,6 +49,29 @@ fn layout_kdl(launcher: &str, uuid: &str, include_git: bool) -> String {
     )
 }
 
+fn codespace_layout_kdl(uuid: &str, codespace_name: &str, remote_workdir: &str) -> Result<String> {
+    let remote_launcher = crate::codespace::remote_launcher_path(codespace_name)?;
+    Ok(format!(
+        r#"layout {{
+    default_tab_template {{
+        pane size=1 borderless=true {{
+            plugin location="tab-bar"
+        }}
+        children
+        pane size=1 borderless=true {{
+            plugin location="status-bar"
+        }}
+    }}
+    tab name="cs" focus=true {{
+        pane command="gh" {{
+            args "codespace" "ssh" "--codespace" "{codespace_name}" "--" "-tt" "sh" "{remote_launcher}" "--connect" "{uuid}" "{remote_workdir}"
+        }}
+    }}
+}}
+"#
+    ))
+}
+
 /// Shell launcher for the copilot pane, written to `~/.csm/launch-copilot.sh`
 /// and invoked as `launch-copilot.sh <uuid>`.
 ///
@@ -69,6 +92,84 @@ fi
 mkdir -p "${HOME}/.csm/markers"
 : > "$marker"
 exec copilot --yolo --autopilot --name="$uuid"
+"#;
+
+const CODESPACE_LAUNCHER_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+export PATH="$HOME/.local/bin:$PATH"
+
+case "$1" in
+    --check)
+        workdir="$2"
+        if [ ! -d "$workdir" ]; then
+            printf 'Codespace workspace does not exist: %s\n' "$workdir" >&2
+            exit 1
+        fi
+        if ! command -v tmux >/dev/null 2>&1; then
+            if ! command -v apt-get >/dev/null 2>&1; then
+                printf 'tmux is not installed and apt-get is unavailable; add tmux to the dev container\n' >&2
+                exit 1
+            fi
+            printf 'tmux is not installed; installing it with apt-get...\n' >&2
+            if [ "$(id -u)" -eq 0 ]; then
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
+            elif command -v sudo >/dev/null 2>&1 && sudo -n true; then
+                sudo -n apt-get update
+                sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
+            else
+                printf 'tmux installation requires root or passwordless sudo\n' >&2
+                exit 1
+            fi
+        fi
+        if ! command -v copilot >/dev/null 2>&1; then
+            if ! command -v curl >/dev/null 2>&1; then
+                printf 'Copilot CLI is not installed and curl is unavailable\n' >&2
+                exit 1
+            fi
+            if ! command -v bash >/dev/null 2>&1; then
+                printf 'Copilot CLI installation requires bash\n' >&2
+                exit 1
+            fi
+            printf 'Copilot CLI is not installed; installing it...\n' >&2
+            curl -fsSL https://gh.io/copilot-install | bash
+            if ! command -v copilot >/dev/null 2>&1; then
+                printf 'Copilot CLI installation completed but copilot is not on PATH\n' >&2
+                exit 1
+            fi
+        fi
+        mkdir -p "$HOME/.csm/markers"
+        ;;
+    --copilot)
+        uuid="$2"
+        marker="$HOME/.csm/markers/$uuid"
+        if [ -f "$marker" ]; then
+            exec copilot --yolo --autopilot --resume="$uuid"
+        fi
+        mkdir -p "$HOME/.csm/markers"
+        : > "$marker"
+        exec copilot --yolo --autopilot --name="$uuid"
+        ;;
+    --connect)
+        uuid="$2"
+        workdir="$3"
+        launcher="$0"
+        tmux_name="csm-${uuid%%-*}"
+        if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+            tmux new-session -d -s "$tmux_name" -n ai -c "$workdir" -- \
+                sh "$launcher" --copilot "$uuid"
+        elif ! tmux list-windows -t "$tmux_name" -F '#{window_name}' | grep -Fqx ai; then
+            tmux new-window -d -t "$tmux_name:" -n ai -c "$workdir" -- \
+                sh "$launcher" --copilot "$uuid"
+        fi
+        tmux select-window -t "$tmux_name:ai"
+        exec tmux attach-session -t "$tmux_name"
+        ;;
+    *)
+        printf 'Invalid Codespace launcher mode\n' >&2
+        exit 2
+        ;;
+esac
 "#;
 
 /// Re-parse a UUID before it is embedded in a layout file or marker path.
@@ -105,16 +206,32 @@ pub fn ensure_layout(uuid: &str, launcher: &Path, include_git: bool) -> Result<P
     Ok(path)
 }
 
-/// Write the copilot launcher script to `~/.csm/launch-copilot.sh` (overwriting
-/// any existing copy so updates to `LAUNCHER_SCRIPT` take effect) with the
-/// executable bit set, and return its path so it can be embedded in the layout
-/// as the `ai` pane command.
-pub fn ensure_launcher() -> Result<PathBuf> {
+pub fn ensure_codespace_layout(
+    uuid: &str,
+    codespace_name: &str,
+    remote_workdir: &str,
+) -> Result<PathBuf> {
+    validate_uuid(uuid)?;
+    crate::codespace::validate_name(codespace_name)?;
+    crate::codespace::validate_remote_workdir(remote_workdir)?;
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let dir = home.join(".csm").join("layouts");
+    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    let path = dir.join(format!("{uuid}.kdl"));
+    std::fs::write(
+        &path,
+        codespace_layout_kdl(uuid, codespace_name, remote_workdir)?,
+    )
+    .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+fn ensure_script(file_name: &str, contents: &str) -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let dir = home.join(".csm");
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-    let path = dir.join("launch-copilot.sh");
-    std::fs::write(&path, LAUNCHER_SCRIPT)
+    let path = dir.join(file_name);
+    std::fs::write(&path, contents)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     #[cfg(unix)]
     {
@@ -127,6 +244,18 @@ pub fn ensure_launcher() -> Result<PathBuf> {
             .with_context(|| format!("Failed to chmod {}", path.display()))?;
     }
     Ok(path)
+}
+
+/// Write the copilot launcher script to `~/.csm/launch-copilot.sh` (overwriting
+/// any existing copy so updates to `LAUNCHER_SCRIPT` take effect) with the
+/// executable bit set, and return its path so it can be embedded in the layout
+/// as the `ai` pane command.
+pub fn ensure_launcher() -> Result<PathBuf> {
+    ensure_script("launch-copilot.sh", LAUNCHER_SCRIPT)
+}
+
+pub fn ensure_codespace_launcher() -> Result<PathBuf> {
+    ensure_script("launch-codespace.sh", CODESPACE_LAUNCHER_SCRIPT)
 }
 
 /// Ensure the launcher marker for `uuid` exists so its next launch resumes
@@ -405,6 +534,40 @@ fed09876 [Created 1h ago]\n";
         assert!(layout.contains(&format!("pane command=\"{launcher}\"")));
         assert!(layout.contains(&format!("args \"{uuid}\"")));
         assert!(layout.contains("name=\"ai\" focus=true"));
+    }
+
+    #[test]
+    fn codespace_layout_has_one_ssh_tab() {
+        let uuid = "abcdef01-2345-6789-abcd-ef0123456789";
+        let layout =
+            codespace_layout_kdl(uuid, "studious-space-123", "/workspaces/example-repo").unwrap();
+        assert!(layout.contains("pane command=\"gh\""));
+        assert!(layout.contains("\"codespace\" \"ssh\""));
+        assert!(
+            layout.contains("\"-tt\" \"sh\" \"/tmp/csm-studious-space-123-launch-codespace.sh\"")
+        );
+        assert!(layout.contains("tab name=\"cs\" focus=true"));
+        assert!(!layout.contains("tab name=\"ai\""));
+        assert!(layout.contains(&format!("\"--connect\" \"{uuid}\"")));
+        assert!(layout.contains("\"/workspaces/example-repo\""));
+        assert_eq!(layout.matches("tab name=").count(), 1);
+        assert!(!layout.contains("gitui"));
+        assert!(!layout.contains("nvim"));
+    }
+
+    #[test]
+    fn codespace_launcher_manages_tmux_and_copilot_resume() {
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("tmux new-session"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("tmux attach-session"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("tmux new-window"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("apt-get install -y tmux"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("sudo -n"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("https://gh.io/copilot-install"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("$HOME/.local/bin:$PATH"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--name=\"$uuid\""));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--resume=\"$uuid\""));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("markers/$uuid"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("launcher=\"$0\""));
     }
 
     #[test]

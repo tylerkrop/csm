@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod codespace;
 mod commands;
 mod db;
 mod display;
@@ -24,12 +25,15 @@ enum Commands {
     /// Create and start a new session
     #[command(alias = "r")]
     Run {
-        /// Branch name suffix (full branch: tylerkrop/<name>)
+        /// Session name and local branch suffix (full branch: tylerkrop/<name>)
         name: String,
         /// Skip worktree creation and run copilot directly in the current
         /// directory (no branch/worktree). Useful for hobby projects.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "codespace")]
         here: bool,
+        /// Create the session in a GitHub Codespace from the default branch
+        #[arg(long, visible_alias = "cs", conflicts_with = "here")]
+        codespace: bool,
     },
     /// Start a stopped session and attach
     #[command(alias = "s")]
@@ -91,7 +95,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { name, here } => commands::run(&name, here).await,
+        Commands::Run {
+            name,
+            here,
+            codespace,
+        } => commands::run(&name, here, codespace).await,
         Commands::Start { name } => commands::start(&name).await,
         Commands::Attach { name } => commands::attach(&name).await,
         Commands::Stop { names } => commands::stop(&names).await,
@@ -104,5 +112,28 @@ async fn main() -> Result<()> {
         Commands::List { all } => commands::list(all).await,
         Commands::Restore { name } => commands::restore(&name).await,
         Commands::Rename { old, new } => commands::rename(&old, &new).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_accepts_codespace_alias() {
+        let cli = Cli::try_parse_from(["csm", "run", "example", "--cs"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Run {
+                codespace: true,
+                here: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn run_rejects_codespace_with_here() {
+        assert!(Cli::try_parse_from(["csm", "run", "example", "--cs", "--here"]).is_err());
     }
 }

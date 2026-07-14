@@ -105,10 +105,12 @@ pub fn format_session_line(
         let name = format!("{BOLD}{name}{RESET}");
         let repo = format!("{CYAN}{repo}{RESET}");
         let branch = format!("{MAGENTA}{branch}{RESET}");
-        let status = match status {
-            "running" => format!("{GREEN}{status}{RESET}"),
-            "exited" => format!("{YELLOW}{status}{RESET}"),
-            _ => format!("{DIM}{status}{RESET}"),
+        let status = if status.starts_with("running") {
+            format!("{GREEN}{status}{RESET}")
+        } else if status.starts_with("exited") {
+            format!("{YELLOW}{status}{RESET}")
+        } else {
+            format!("{DIM}{status}{RESET}")
         };
         let ago = format!("{DIM}[{ago}]{RESET}");
         format!("{shortcode} {name} {repo} {branch} {status} {ago}")
@@ -119,7 +121,7 @@ pub fn format_session_line(
 
 /// Rank a status string for sorting (lower = higher priority).
 pub fn status_rank(s: &str) -> u8 {
-    match s {
+    match s.split('/').next().unwrap_or(s) {
         "running" => 0,
         "exited" => 1,
         "stopped" => 2,
@@ -231,6 +233,8 @@ mod tests {
         assert!(status_rank("exited") < status_rank("stopped"));
         assert!(status_rank("stopped") < status_rank("removed"));
         assert!(status_rank("removed") < status_rank("anything else"));
+        assert_eq!(status_rank("running/available"), status_rank("running"));
+        assert_eq!(status_rank("stopped/shutdown"), status_rank("stopped"));
     }
 
     #[test]

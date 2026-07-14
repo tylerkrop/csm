@@ -9,6 +9,10 @@ pub struct Model {
     pub copilot_uuid: String,
     pub source_repo: String,
     pub worktree_path: String,
+    pub backend: String,
+    pub codespace_name: Option<String>,
+    pub remote_workdir: Option<String>,
+    pub github_login: Option<String>,
     pub status: String,
     pub last_used_at: String,
 }
