@@ -86,10 +86,11 @@ There is no daemon or server. csm shells out to external binaries (`git`,
   (`<name>-2`, …) rather than erroring; the branch keeps the requested name.
 - The `ai` tab runs `~/.csm/launch-copilot.sh <uuid>` as a zellij command pane
   (not an injected keystroke), so zellij owns copilot and offers Enter-to-rerun
-  on exit, like the `git`/`edit` tabs. The launcher self-selects `copilot --name`
-  on a session's first launch and `copilot --resume` afterward, keyed by a marker
-  file (`~/.csm/markers/<uuid>`) written before the first `--name` launch so a
-  killed session never spawns a duplicate. `run` starts a session with
+  on exit, like the `git`/`edit` tabs. The launcher self-selects
+  `copilot --session-id` on a session's first launch and `copilot --resume`
+  afterward, keyed by a marker file (`~/.csm/markers/<uuid>`) written before the
+  first `--session-id` launch so a killed session resumes on the next launch.
+  `run` starts a session with
   `resume=false` (let the launcher create the marker); `start`/`restore` pass
   `resume=true`, which calls `zellij::ensure_marker` up front so pre-existing
   sessions resume. Preserve this marker contract when changing session startup.
