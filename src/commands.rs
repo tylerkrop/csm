@@ -211,13 +211,13 @@ async fn enter_local_zellij(
 
 /// Launch a fresh zellij session whose `ai` tab runs the copilot launcher.
 /// Used by `run`, `start`, and `restore`, which share the same startup shape.
-/// The launcher itself picks `copilot --name` (first launch) vs
+/// The launcher itself picks `copilot --session-id` (first launch) vs
 /// `copilot --resume` (subsequent launches) via a per-session marker, so csm no
 /// longer types the command into the pane. Pass `resume = true` when relaunching
 /// an existing session (`start`/`restore`) so the marker is ensured up front and
 /// the launcher resumes even for sessions created before the launcher existed;
 /// pass `resume = false` for a brand-new session (`run`), letting the launcher
-/// create the marker on its first `--name` launch.
+/// create the marker on its first `--session-id` launch.
 async fn start_local_zellij_session(
     db: &DatabaseConnection,
     session_name: &str,

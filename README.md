@@ -35,7 +35,7 @@ cargo install --path .
 csm run <name>
 ```
 
-Creates a Git branch (`tylerkrop/<name>`) and worktree, starts a Zellij session, and injects the Copilot resume command. The worktree is created under `~/.csm/worktrees/<repo>/<repo>-<shortcode>`, where `<shortcode>` is the first 8 hex characters of the session's UUID.
+Creates a Git branch (`tylerkrop/<name>`) and worktree, starts a Zellij session, and launches Copilot with the session's stable UUID. The worktree is created under `~/.csm/worktrees/<repo>/<repo>-<shortcode>`, where `<shortcode>` is the first 8 hex characters of the session's UUID.
 
 If the current repository is on a default branch (`main` or `master`), csm runs `git pull` first so the new worktree branches from up-to-date history. If you run `csm run` in a directory that is not a Git repository, csm skips branch/worktree creation and starts Copilot directly in the current directory.
 
@@ -172,11 +172,11 @@ csm rename <old> <new>
 
 1. Local `csm run` finds the current Git repo, creates a new branch (prefixed with `tylerkrop/`) and worktree, and inserts a session record into SQLite. With `--codespace`, csm resolves the repository's default branch and delegates creation to `gh codespace create` instead.
 2. A Zellij session is started in the worktree directory, named after the first 8 hex characters of the session's UUID. The session uses a per-session layout (written to `~/.csm/layouts/<uuid>.kdl`, with a no-Git variant when there is no Git repo) with named tabs: `ai` (focused), `git` (runs `gitui`, omitted outside a Git repo), and `edit` (runs `nvim`). A config (written to `~/.csm/config.kdl`) enables the simplified ASCII UI (`simplified_ui`) and removes pane frames/borders (`pane_frames false`).
-3. The `ai` tab runs a small launcher script (`~/.csm/launch-copilot.sh <uuid>`) as a Zellij command pane, so Zellij owns the Copilot process just like `gitui`/`nvim` in the other tabs: when Copilot exits you can press Enter to re-run it. The launcher records a marker under `~/.csm/markers/<uuid>` on a session's first launch and uses it to pick the right flag. It runs `copilot --name=<uuid>` the first time, then `copilot --resume=<uuid>` on every re-run, so re-running resumes the same conversation instead of creating a duplicate that merely shares the name.
+3. The `ai` tab runs a small launcher script (`~/.csm/launch-copilot.sh <uuid>`) as a Zellij command pane, so Zellij owns the Copilot process just like `gitui`/`nvim` in the other tabs: when Copilot exits you can press Enter to re-run it. The launcher records a marker under `~/.csm/markers/<uuid>` on a session's first launch and uses it to pick the right flag. It runs `copilot --session-id=<uuid>` the first time, then `copilot --resume=<uuid>` on every re-run, so re-running resumes the same conversation.
 4. On detach, the `last_used_at` timestamp is updated. If the user quit Zellij entirely (e.g. `Ctrl+q`), the exited Zellij session is cleaned up so it shows as `stopped` in `csm list`.
 5. Sessions can be stopped, restarted, removed, or restored independently — the underlying Git branch persists until explicitly destroyed with `remove -f`.
 
-For Codespace sessions, csm copies a launcher, Zellij layout, and config to Codespace-specific paths under `/tmp`. The launcher creates or attaches to a UUID-scoped remote Zellij session and uses a marker under `~/.csm/markers` to select `copilot --name` on first launch or `copilot --resume` later.
+For Codespace sessions, csm copies a launcher, Zellij layout, and config to Codespace-specific paths under `/tmp`. The launcher creates or attaches to a UUID-scoped remote Zellij session and uses a marker under `~/.csm/markers` to select `copilot --session-id` on first launch or `copilot --resume` later.
 
 The SQLite database is opened in WAL mode with a 5-second busy timeout, so multiple `csm` invocations can run concurrently without `SQLITE_BUSY` errors.
 
@@ -188,7 +188,7 @@ All data lives under `~/.csm/`:
 ~/.csm/
 ├── sessions.db                              # SQLite database
 ├── config.kdl                               # Zellij config (ASCII UI, no pane frames)
-├── launch-copilot.sh                        # Copilot launcher (picks --name/--resume)
+├── launch-copilot.sh                        # Copilot launcher (picks --session-id/--resume)
 ├── launch-codespace.sh                      # Script copied into Codespaces
 ├── layouts/
 │   └── <uuid>.kdl                           # Per-session Zellij layout

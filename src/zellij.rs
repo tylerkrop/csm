@@ -81,12 +81,11 @@ fn codespace_layout_kdl(uuid: &str, remote_launcher: &str) -> String {
 /// and invoked as `launch-copilot.sh <uuid>`.
 ///
 /// It records a per-session marker under `~/.csm/markers/<uuid>` the first time
-/// it runs and uses that marker to choose between creating (`--name`) and
+/// it runs and uses that marker to choose between creating (`--session-id`) and
 /// resuming (`--resume`) the copilot session. This lets a static zellij command
-/// pane be re-run (Enter) after copilot exits and resume the same conversation
-/// instead of spawning a duplicate named session. The marker is written *before*
-/// the first `--name` launch, so a session killed before copilot exits cleanly
-/// still resumes (never duplicates) on its next launch.
+/// pane be re-run (Enter) after copilot exits and resume the same conversation.
+/// The marker is written *before* the first `--session-id` launch, so a session
+/// killed before copilot exits cleanly still resumes on its next launch.
 const LAUNCHER_SCRIPT: &str = r#"#!/bin/sh
 set -u
 uuid="$1"
@@ -96,7 +95,7 @@ if [ -f "$marker" ]; then
 fi
 mkdir -p "${HOME}/.csm/markers"
 : > "$marker"
-exec copilot --yolo --autopilot --name="$uuid"
+exec copilot --yolo --autopilot --session-id="$uuid"
 "#;
 
 const CODESPACE_LAUNCHER_SCRIPT: &str = r##"#!/bin/sh
@@ -224,7 +223,7 @@ case "$1" in
         fi
         mkdir -p "$HOME/.csm/markers"
         : > "$marker"
-        exec copilot --yolo --autopilot --name="$uuid"
+        exec copilot --yolo --autopilot --session-id="$uuid"
         ;;
     --connect)
         uuid="$2"
@@ -378,10 +377,9 @@ pub fn ensure_codespace_launcher() -> Result<PathBuf> {
 }
 
 /// Ensure the launcher marker for `uuid` exists so its next launch resumes
-/// (`--resume`) rather than creates (`--name`) the copilot session. Called when
-/// relaunching an existing session (`start`/`restore`), including sessions
-/// created before the launcher existed, so they never spawn a duplicate named
-/// session.
+/// (`--resume`) rather than creates (`--session-id`) the copilot session.
+/// Called when relaunching an existing session (`start`/`restore`), including
+/// sessions created before the launcher existed.
 pub fn ensure_marker(uuid: &str) -> Result<()> {
     validate_uuid(uuid)?;
     let home = dirs::home_dir().context("Could not determine home directory")?;
@@ -687,8 +685,9 @@ fed09876 [Created 1h ago]\n";
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--clear-ready)"));
         assert!(!CODESPACE_LAUNCHER_SCRIPT.contains("tmux new-session"));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("$HOME/.local/bin:$mise_shims:$PATH"));
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--name=\"$uuid\""));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--session-id=\"$uuid\""));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--resume=\"$uuid\""));
+        assert!(!CODESPACE_LAUNCHER_SCRIPT.contains("--name="));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("markers/$uuid"));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--attach)"));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--state)"));
@@ -696,9 +695,10 @@ fed09876 [Created 1h ago]\n";
     }
 
     #[test]
-    fn launcher_script_selects_name_then_resume() {
-        assert!(LAUNCHER_SCRIPT.contains("--name=\"$uuid\""));
+    fn launcher_script_selects_session_id_then_resume() {
+        assert!(LAUNCHER_SCRIPT.contains("--session-id=\"$uuid\""));
         assert!(LAUNCHER_SCRIPT.contains("--resume=\"$uuid\""));
+        assert!(!LAUNCHER_SCRIPT.contains("--name="));
         assert!(LAUNCHER_SCRIPT.contains("markers/${uuid}"));
     }
 
