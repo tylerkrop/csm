@@ -7,7 +7,7 @@ A CLI tool for managing [GitHub Copilot](https://github.com/features/copilot) co
 - **One command to start coding** — `csm run <name>` creates a branch, worktree, Zellij session, and launches Copilot in one step.
 - **Session lifecycle management** — start, stop, attach, remove, restore, and rename sessions.
 - **Git worktree isolation** — each session works in its own worktree so you can run multiple sessions in parallel without conflicts.
-- **GitHub Codespaces support** - create from a repository's default branch and run Copilot inside a persistent remote tmux session.
+- **GitHub Codespaces support** - create from a repository's default branch and work directly inside a persistent remote Zellij session.
 - **Persistent state** — session metadata is stored in a local SQLite database (`~/.csm/sessions.db`).
 - **Copilot auto-resume** — sessions are tied to a stable UUID so Copilot can resume context across restarts.
 
@@ -17,7 +17,6 @@ A CLI tool for managing [GitHub Copilot](https://github.com/features/copilot) co
 - [Zellij](https://zellij.dev/documentation/installation)
 - [GitHub Copilot CLI](https://docs.github.com/en/copilot)
 - [GitHub CLI](https://cli.github.com/) (required for Codespace sessions)
-- tmux in the Codespace (installed automatically with `apt-get` when available)
 - [gitui](https://github.com/gitui-org/gitui) (used by the `git` tab in the default layout)
 - [Neovim](https://neovim.io) (used by the `edit` tab in the default layout)
 - Git
@@ -53,17 +52,17 @@ csm run <name> --codespace
 csm run <name> --cs
 ```
 
-Codespace sessions are always created from the current GitHub repository's default branch so they can use available prebuilds. `csm` hands creation to `gh codespace create`, which may prompt for a dev container, machine type, or additional permissions. Local uncommitted and unpushed changes are not copied into the Codespace.
+Codespace sessions are always created from the current GitHub repository's default branch so they can use available prebuilds. `csm` hands creation to `gh codespace create -s`, which may prompt for a dev container, machine type, or additional permissions and waits for dotfiles and post-create setup to finish. Local uncommitted and unpushed changes are not copied into the Codespace.
 
-After creation, csm opens a local Zellij session with one `cs` tab. That tab connects with `gh codespace ssh` and attaches to a remote tmux session. Its first window is named `ai` and runs `copilot --autopilot --yolo`; create another tmux window when you want to create or switch to a task branch manually.
+After creation, csm connects over `gh codespace ssh` directly to a Zellij session running inside the Codespace. It uses the same three-tab layout as local sessions: `ai` runs `copilot --autopilot --yolo`, `git` runs gitui, and `edit` runs Neovim. There is no local Zellij wrapper and no nested terminal multiplexer.
 
-Detaching or losing SSH leaves tmux and Copilot running in the Codespace. `csm stop` also stops the Codespace to avoid continued billing. A soft `csm remove` stops and retains the Codespace, `csm restore` reconnects it, and `csm remove -f` deletes it.
+Detaching or losing SSH leaves remote Zellij and Copilot running in the Codespace. Quitting remote Zellij with `Ctrl+q` stops the Codespace. `csm stop` also stops it explicitly to avoid continued billing. A soft `csm remove` stops and retains the Codespace, `csm restore` recreates the remote Zellij session, and `csm remove -f` deletes the Codespace.
 
 csm records the GitHub account that created each Codespace. If you later switch accounts with `gh auth switch`, switch back to the recorded account before starting, stopping, restoring, or deleting that session.
 
-If tmux is missing, csm installs it with `apt-get` using root or passwordless `sudo`. Custom images without `apt-get` must provide tmux in their dev container configuration.
+The Codespace setup must provide both Zellij and Copilot CLI. csm verifies both commands after `gh codespace create -s` finishes.
 
-If Copilot CLI is missing, csm installs it with the official `https://gh.io/copilot-install` script. This requires `curl` and `bash` in the Codespace.
+Sessions created by the earlier tmux-based Codespace flow are not terminated automatically. If csm detects a legacy tmux session, it prints the direct `gh codespace ssh ... tmux attach` command so its work can be preserved and exited before migration to remote Zellij.
 
 Session names must be alphanumeric and may contain `-` or `_`.
 
@@ -74,7 +73,7 @@ csm list        # active sessions
 csm list -a     # include removed sessions
 ```
 
-Shows the session shortcode, name, repository, branch, status (running/exited/stopped/removed), and last-used time. Codespace repositories have an `@cs` suffix and their status includes both local Zellij and remote Codespace state, such as `running/available`. Sessions are sorted by status (running first) then most recently used.
+Shows the session shortcode, name, repository, branch, status (running/exited/stopped/removed), and last-used time. Codespace repositories have an `@cs` suffix and combine Zellij with Codespace state, such as `running/available` or `stopped/shutdown`. During migration, list also recognizes the local Zellij wrappers used by older tmux-based Codespace sessions. Sessions are sorted by status then most recently used.
 
 ### Attach to a running session
 
@@ -92,7 +91,7 @@ csm start <name>
 
 Recreates the Zellij session and resumes Copilot with `--resume`, so the
 session's prior conversation context is restored rather than started fresh.
-For a Codespace session, this also starts the Codespace and reattaches tmux.
+For a Codespace session, this also starts the Codespace and recreates or reattaches remote Zellij.
 
 ### Stop a session
 
@@ -177,7 +176,7 @@ csm rename <old> <new>
 4. On detach, the `last_used_at` timestamp is updated. If the user quit Zellij entirely (e.g. `Ctrl+q`), the exited Zellij session is cleaned up so it shows as `stopped` in `csm list`.
 5. Sessions can be stopped, restarted, removed, or restored independently — the underlying Git branch persists until explicitly destroyed with `remove -f`.
 
-For Codespace sessions, csm copies a remote launcher to a Codespace-specific path under `/tmp`. The launcher creates or reattaches a UUID-scoped tmux session, restores the `ai` window if it exited, and uses a remote marker under `~/.csm/markers` to select `copilot --name` on first launch or `copilot --resume` later.
+For Codespace sessions, csm copies a launcher, Zellij layout, and config to Codespace-specific paths under `/tmp`. The launcher creates or attaches to a UUID-scoped remote Zellij session and uses a marker under `~/.csm/markers` to select `copilot --name` on first launch or `copilot --resume` later.
 
 The SQLite database is opened in WAL mode with a 5-second busy timeout, so multiple `csm` invocations can run concurrently without `SQLITE_BUSY` errors.
 

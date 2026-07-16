@@ -49,9 +49,8 @@ fn layout_kdl(launcher: &str, uuid: &str, include_git: bool) -> String {
     )
 }
 
-fn codespace_layout_kdl(uuid: &str, codespace_name: &str, remote_workdir: &str) -> Result<String> {
-    let remote_launcher = crate::codespace::remote_launcher_path(codespace_name)?;
-    Ok(format!(
+fn codespace_layout_kdl(uuid: &str, remote_launcher: &str) -> String {
+    format!(
         r#"layout {{
     default_tab_template {{
         pane size=1 borderless=true {{
@@ -62,14 +61,20 @@ fn codespace_layout_kdl(uuid: &str, codespace_name: &str, remote_workdir: &str) 
             plugin location="status-bar"
         }}
     }}
-    tab name="cs" focus=true {{
-        pane command="gh" {{
-            args "codespace" "ssh" "--codespace" "{codespace_name}" "--" "-tt" "sh" "{remote_launcher}" "--connect" "{uuid}" "{remote_workdir}"
+    tab name="ai" focus=true {{
+        pane command="sh" {{
+            args "{remote_launcher}" "--copilot" "{uuid}"
         }}
+    }}
+    tab name="git" {{
+        pane command="gitui"
+    }}
+    tab name="edit" {{
+        pane command="nvim"
     }}
 }}
 "#
-    ))
+    )
 }
 
 /// Shell launcher for the copilot pane, written to `~/.csm/launch-copilot.sh`
@@ -94,51 +99,122 @@ mkdir -p "${HOME}/.csm/markers"
 exec copilot --yolo --autopilot --name="$uuid"
 "#;
 
-const CODESPACE_LAUNCHER_SCRIPT: &str = r#"#!/bin/sh
+const CODESPACE_LAUNCHER_SCRIPT: &str = r##"#!/bin/sh
 set -eu
-export PATH="$HOME/.local/bin:$PATH"
+mise_shims="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}/shims"
+export PATH="$HOME/.local/bin:$mise_shims:$PATH"
+
+session_state() {
+    session_name="$1"
+    if command -v tmux >/dev/null 2>&1 \
+        && tmux has-session -t "csm-$session_name" 2>/dev/null; then
+        printf 'legacy\n'
+        return
+    fi
+    sessions="$(zellij list-sessions -n 2>/dev/null || true)"
+    line="$(printf '%s\n' "$sessions" | awk -v name="$session_name" '$1 == name { print; exit }')"
+    if [ -z "$line" ]; then
+        printf 'missing\n'
+    elif printf '%s\n' "$line" | grep -Fq EXITED; then
+        printf 'exited\n'
+    else
+        printf 'running\n'
+    fi
+}
+
+ensure_tabs() {
+    session_name="$1"
+    workdir="$2"
+    uuid="$3"
+    launcher="$4"
+    lock_root="/tmp/csm-zellij-tab-locks"
+    lock_dir="$lock_root/$session_name"
+    mkdir -p "$lock_root"
+    attempts=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$lock_dir"
+            continue
+        fi
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 100 ]; then
+            printf 'Timed out waiting to reconcile Zellij tabs\n' >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    cleanup_tab_lock() {
+        rm -rf "$lock_dir"
+    }
+    trap 'cleanup_tab_lock' EXIT
+    trap 'exit 130' HUP INT TERM
+
+    panes="$(zellij --session "$session_name" action list-panes --json --tab)"
+    if ! printf '%s\n' "$panes" | grep -Fq '"tab_name": "ai"'; then
+        zellij --session "$session_name" action new-tab \
+            --name ai --cwd "$workdir" -- sh "$launcher" --copilot "$uuid" >/dev/null
+    fi
+    panes="$(zellij --session "$session_name" action list-panes --json --tab)"
+    if ! printf '%s\n' "$panes" | grep -Fq '"tab_name": "git"'; then
+        zellij --session "$session_name" action new-tab \
+            --name git --cwd "$workdir" -- gitui >/dev/null
+    fi
+    panes="$(zellij --session "$session_name" action list-panes --json --tab)"
+    if ! printf '%s\n' "$panes" | grep -Fq '"tab_name": "edit"'; then
+        zellij --session "$session_name" action new-tab \
+            --name edit --cwd "$workdir" -- nvim >/dev/null
+    fi
+    panes="$(zellij --session "$session_name" action list-panes --json --tab)"
+    if printf '%s\n' "$panes" | grep -Fq '"tab_name": "Tab #1"'; then
+        tab_id="$(zellij --session "$session_name" action list-panes --tab \
+            | awk '$3 == "Tab" && $4 == "#1" { print $1; exit }')"
+        if [ -n "$tab_id" ]; then
+            zellij --session "$session_name" action close-tab --tab-id "$tab_id"
+        fi
+    fi
+    panes="$(zellij --session "$session_name" action list-panes --json --tab)"
+    for tab_name in ai git edit; do
+        if ! printf '%s\n' "$panes" | grep -Fq "\"tab_name\": \"$tab_name\""; then
+            printf 'Failed to create required Zellij tab: %s\n' "$tab_name" >&2
+            exit 1
+        fi
+    done
+    zellij --session "$session_name" action go-to-tab-name ai >/dev/null
+    cleanup_tab_lock
+    trap - EXIT HUP INT TERM
+}
 
 case "$1" in
     --check)
         workdir="$2"
+        layout="$3"
+        config="$4"
+        uuid="$5"
+        resume="$6"
         if [ ! -d "$workdir" ]; then
             printf 'Codespace workspace does not exist: %s\n' "$workdir" >&2
             exit 1
         fi
-        if ! command -v tmux >/dev/null 2>&1; then
-            if ! command -v apt-get >/dev/null 2>&1; then
-                printf 'tmux is not installed and apt-get is unavailable; add tmux to the dev container\n' >&2
-                exit 1
-            fi
-            printf 'tmux is not installed; installing it with apt-get...\n' >&2
-            if [ "$(id -u)" -eq 0 ]; then
-                apt-get update
-                DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
-            elif command -v sudo >/dev/null 2>&1 && sudo -n true; then
-                sudo -n apt-get update
-                sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
-            else
-                printf 'tmux installation requires root or passwordless sudo\n' >&2
-                exit 1
-            fi
+        if [ ! -f "$layout" ]; then
+            printf 'Codespace Zellij layout does not exist: %s\n' "$layout" >&2
+            exit 1
         fi
-        if ! command -v copilot >/dev/null 2>&1; then
-            if ! command -v curl >/dev/null 2>&1; then
-                printf 'Copilot CLI is not installed and curl is unavailable\n' >&2
-                exit 1
-            fi
-            if ! command -v bash >/dev/null 2>&1; then
-                printf 'Copilot CLI installation requires bash\n' >&2
-                exit 1
-            fi
-            printf 'Copilot CLI is not installed; installing it...\n' >&2
-            curl -fsSL https://gh.io/copilot-install | bash
-            if ! command -v copilot >/dev/null 2>&1; then
-                printf 'Copilot CLI installation completed but copilot is not on PATH\n' >&2
-                exit 1
-            fi
+        if [ ! -f "$config" ]; then
+            printf 'Codespace Zellij config does not exist: %s\n' "$config" >&2
+            exit 1
         fi
+        for command_name in zellij copilot; do
+            if ! command -v "$command_name" >/dev/null 2>&1; then
+                printf '%s is not installed after Codespace setup\n' "$command_name" >&2
+                exit 1
+            fi
+        done
         mkdir -p "$HOME/.csm/markers"
+        if [ "$resume" = "true" ]; then
+            : > "$HOME/.csm/markers/$uuid"
+        fi
         ;;
     --copilot)
         uuid="$2"
@@ -153,24 +229,74 @@ case "$1" in
     --connect)
         uuid="$2"
         workdir="$3"
-        launcher="$0"
-        tmux_name="csm-${uuid%%-*}"
-        if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
-            tmux new-session -d -s "$tmux_name" -n ai -c "$workdir" -- \
-                sh "$launcher" --copilot "$uuid"
-        elif ! tmux list-windows -t "$tmux_name" -F '#{window_name}' | grep -Fqx ai; then
-            tmux new-window -d -t "$tmux_name:" -n ai -c "$workdir" -- \
-                sh "$launcher" --copilot "$uuid"
+        layout="$4"
+        config="$5"
+        session_name="${uuid%%-*}"
+        state="$(session_state "$session_name")"
+        if [ "$state" = "legacy" ]; then
+            printf 'Legacy tmux session is still running: csm-%s\n' "$session_name" >&2
+            exit 1
         fi
-        tmux select-window -t "$tmux_name:ai"
-        exec tmux attach-session -t "$tmux_name"
+        if [ "$state" = "running" ]; then
+            ensure_tabs "$session_name" "$workdir" "$uuid" "$0"
+            : > "/tmp/csm-zellij-$session_name.ready"
+            exec zellij --config "$config" attach "$session_name"
+        fi
+        if [ "$state" = "exited" ]; then
+            zellij delete-session --force "$session_name" >/dev/null 2>&1 || true
+        fi
+        cd "$workdir"
+        zellij --config "$config" attach --create-background "$session_name" >/dev/null
+        zellij --config "$config" --session "$session_name" --layout "$layout" >/dev/null
+        ensure_tabs "$session_name" "$workdir" "$uuid" "$0"
+        : > "/tmp/csm-zellij-$session_name.ready"
+        exec zellij --config "$config" attach "$session_name"
+        ;;
+    --attach)
+        uuid="$2"
+        workdir="$3"
+        config="$4"
+        session_name="${uuid%%-*}"
+        state="$(session_state "$session_name")"
+        if [ "$state" = "legacy" ]; then
+            printf 'Legacy tmux session is still running: csm-%s\n' "$session_name" >&2
+            exit 1
+        fi
+        if [ "$state" != "running" ]; then
+            printf 'Remote Zellij session is not running: %s\n' "$session_name" >&2
+            exit 1
+        fi
+        ensure_tabs "$session_name" "$workdir" "$uuid" "$0"
+        : > "/tmp/csm-zellij-$session_name.ready"
+        exec zellij --config "$config" attach "$session_name"
+        ;;
+    --state)
+        uuid="$2"
+        session_state "${uuid%%-*}"
+        ;;
+    --ready)
+        uuid="$2"
+        if [ -f "/tmp/csm-zellij-${uuid%%-*}.ready" ]; then
+            printf 'ready\n'
+        else
+            printf 'not-ready\n'
+        fi
+        ;;
+    --clear-ready)
+        uuid="$2"
+        rm -f "/tmp/csm-zellij-${uuid%%-*}.ready"
+        ;;
+    --cleanup)
+        uuid="$2"
+        zellij delete-session --force "${uuid%%-*}" >/dev/null 2>&1 || true
+        rm -f "/tmp/csm-zellij-${uuid%%-*}.ready"
         ;;
     *)
         printf 'Invalid Codespace launcher mode\n' >&2
         exit 2
         ;;
 esac
-"#;
+"##;
 
 /// Re-parse a UUID before it is embedded in a layout file or marker path.
 /// Defense in depth: these strings come from the database and are written into
@@ -206,23 +332,16 @@ pub fn ensure_layout(uuid: &str, launcher: &Path, include_git: bool) -> Result<P
     Ok(path)
 }
 
-pub fn ensure_codespace_layout(
-    uuid: &str,
-    codespace_name: &str,
-    remote_workdir: &str,
-) -> Result<PathBuf> {
+pub fn ensure_codespace_layout(uuid: &str, codespace_name: &str) -> Result<PathBuf> {
     validate_uuid(uuid)?;
     crate::codespace::validate_name(codespace_name)?;
-    crate::codespace::validate_remote_workdir(remote_workdir)?;
+    let remote_launcher = crate::codespace::remote_launcher_path(codespace_name)?;
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let dir = home.join(".csm").join("layouts");
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     let path = dir.join(format!("{uuid}.kdl"));
-    std::fs::write(
-        &path,
-        codespace_layout_kdl(uuid, codespace_name, remote_workdir)?,
-    )
-    .with_context(|| format!("Failed to write {}", path.display()))?;
+    std::fs::write(&path, codespace_layout_kdl(uuid, &remote_launcher))
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(path)
 }
 
@@ -537,37 +656,43 @@ fed09876 [Created 1h ago]\n";
     }
 
     #[test]
-    fn codespace_layout_has_one_ssh_tab() {
+    fn codespace_layout_has_remote_ai_tab() {
         let uuid = "abcdef01-2345-6789-abcd-ef0123456789";
-        let layout =
-            codespace_layout_kdl(uuid, "studious-space-123", "/workspaces/example-repo").unwrap();
-        assert!(layout.contains("pane command=\"gh\""));
-        assert!(layout.contains("\"codespace\" \"ssh\""));
-        assert!(
-            layout.contains("\"-tt\" \"sh\" \"/tmp/csm-studious-space-123-launch-codespace.sh\"")
-        );
-        assert!(layout.contains("tab name=\"cs\" focus=true"));
-        assert!(!layout.contains("tab name=\"ai\""));
-        assert!(layout.contains(&format!("\"--connect\" \"{uuid}\"")));
-        assert!(layout.contains("\"/workspaces/example-repo\""));
-        assert_eq!(layout.matches("tab name=").count(), 1);
-        assert!(!layout.contains("gitui"));
-        assert!(!layout.contains("nvim"));
+        let launcher = "/tmp/csm-studious-space-123-launch-codespace.sh";
+        let layout = codespace_layout_kdl(uuid, launcher);
+        assert!(layout.contains("pane command=\"sh\""));
+        assert!(layout.contains(&format!("args \"{launcher}\" \"--copilot\" \"{uuid}\"")));
+        assert!(layout.contains("tab name=\"ai\" focus=true"));
+        assert!(layout.contains("tab name=\"git\""));
+        assert!(layout.contains("pane command=\"gitui\""));
+        assert!(layout.contains("tab name=\"edit\""));
+        assert!(layout.contains("pane command=\"nvim\""));
+        assert_eq!(layout.matches("tab name=").count(), 3);
+        assert!(!layout.contains("codespace ssh"));
+        assert!(!layout.contains("tmux"));
     }
 
     #[test]
-    fn codespace_launcher_manages_tmux_and_copilot_resume() {
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("tmux new-session"));
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("tmux attach-session"));
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("tmux new-window"));
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("apt-get install -y tmux"));
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("sudo -n"));
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("https://gh.io/copilot-install"));
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("$HOME/.local/bin:$PATH"));
+    fn codespace_launcher_manages_remote_zellij_and_copilot_resume() {
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("zellij list-sessions -n"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("zellij --config \"$config\" attach"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("zellij delete-session --force"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("attach --create-background"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--session \"$session_name\" --layout"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("close-tab --tab-id \"$tab_id\""));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("action new-tab"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--name ai"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("go-to-tab-name ai"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--ready)"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--clear-ready)"));
+        assert!(!CODESPACE_LAUNCHER_SCRIPT.contains("tmux new-session"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("$HOME/.local/bin:$mise_shims:$PATH"));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--name=\"$uuid\""));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--resume=\"$uuid\""));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("markers/$uuid"));
-        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("launcher=\"$0\""));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--attach)"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--state)"));
+        assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--cleanup)"));
     }
 
     #[test]

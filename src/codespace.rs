@@ -19,6 +19,31 @@ pub struct RemoteState {
     pub branch: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteZellijState {
+    Running,
+    Exited,
+    Missing,
+    LegacyTmux,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteSetupOutcome {
+    Ready,
+    LegacyTmux,
+}
+
+pub struct RemoteSetup<'a> {
+    pub name: &'a str,
+    pub workdir: &'a str,
+    pub launcher: &'a Path,
+    pub layout: &'a Path,
+    pub config: &'a Path,
+    pub uuid: &'a str,
+    pub resume: bool,
+    pub github_login: &'a str,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RepoView {
@@ -207,6 +232,20 @@ pub fn remote_launcher_path(codespace_name: &str) -> Result<String> {
     Ok(format!("/tmp/csm-{codespace_name}-launch-codespace.sh"))
 }
 
+pub fn remote_layout_path(codespace_name: &str, uuid: &str) -> Result<String> {
+    validate_name(codespace_name)?;
+    uuid::Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
+    Ok(format!(
+        "/tmp/csm-{codespace_name}-{}.kdl",
+        crate::display::short_uuid(uuid)
+    ))
+}
+
+pub fn remote_config_path(codespace_name: &str) -> Result<String> {
+    validate_name(codespace_name)?;
+    Ok(format!("/tmp/csm-{codespace_name}-config.kdl"))
+}
+
 pub fn check_auth() -> Result<()> {
     gh_output(
         &["auth", "status", "--active", "--hostname", "github.com"],
@@ -305,6 +344,7 @@ pub fn create(repo: &RepoInfo, session_name: &str, uuid: &str) -> Result<String>
             &repo.default_branch,
             "--display-name",
             &display_name,
+            "-s",
         ])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -330,34 +370,62 @@ pub fn create(repo: &RepoInfo, session_name: &str, uuid: &str) -> Result<String>
     }
 }
 
-pub fn prepare_remote(
-    name: &str,
-    workdir: &str,
-    launcher: &Path,
-    github_login: &str,
-) -> Result<()> {
+pub fn prepare_remote(setup: RemoteSetup<'_>) -> Result<RemoteSetupOutcome> {
+    let RemoteSetup {
+        name,
+        workdir,
+        launcher,
+        layout,
+        config,
+        uuid,
+        resume,
+        github_login,
+    } = setup;
     validate_name(name)?;
     validate_remote_workdir(workdir)?;
+    uuid::Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
     ensure_account(github_login)?;
     let launcher = launcher
         .to_str()
         .context("Codespace launcher path contains invalid UTF-8")?;
+    let layout = layout
+        .to_str()
+        .context("Codespace layout path contains invalid UTF-8")?;
+    let config = config
+        .to_str()
+        .context("Codespace config path contains invalid UTF-8")?;
     let remote_launcher = remote_launcher_path(name)?;
-    let remote_destination = format!("remote:{remote_launcher}");
-    eprintln!("Uploading launcher to Codespace '{name}'...");
-    gh_output(
-        &[
-            "codespace",
-            "cp",
-            "--expand",
-            "--codespace",
-            name,
+    let remote_layout = remote_layout_path(name, uuid)?;
+    let remote_config = remote_config_path(name)?;
+    eprintln!("Uploading remote Zellij files to Codespace '{name}'...");
+    for (source, destination, action) in [
+        (
             launcher,
-            &remote_destination,
-        ],
-        "Codespace launcher copy",
-    )?;
+            remote_launcher.as_str(),
+            "Codespace launcher copy",
+        ),
+        (layout, remote_layout.as_str(), "Codespace layout copy"),
+        (config, remote_config.as_str(), "Codespace config copy"),
+    ] {
+        let remote_destination = format!("remote:{destination}");
+        gh_output(
+            &[
+                "codespace",
+                "cp",
+                "--expand",
+                "--codespace",
+                name,
+                source,
+                &remote_destination,
+            ],
+            action,
+        )?;
+    }
+    if remote_zellij_state(name, uuid, github_login)? == RemoteZellijState::LegacyTmux {
+        return Ok(RemoteSetupOutcome::LegacyTmux);
+    }
     eprintln!("Checking Codespace workspace and dependencies...");
+    let resume = if resume { "true" } else { "false" };
     gh_status(
         &[
             "codespace",
@@ -369,10 +437,129 @@ pub fn prepare_remote(
             &remote_launcher,
             "--check",
             workdir,
+            &remote_layout,
+            &remote_config,
+            uuid,
+            resume,
         ],
         "Codespace preflight",
     )?;
     eprintln!("Codespace environment is ready.");
+    Ok(RemoteSetupOutcome::Ready)
+}
+
+fn remote_launcher_output(
+    name: &str,
+    github_login: &str,
+    args: &[&str],
+    action: &str,
+) -> Result<String> {
+    validate_name(name)?;
+    ensure_account(github_login)?;
+    let remote_launcher = remote_launcher_path(name)?;
+    let mut command = Command::new("gh");
+    command.args([
+        "codespace",
+        "ssh",
+        "--codespace",
+        name,
+        "--",
+        "sh",
+        &remote_launcher,
+    ]);
+    command.args(args);
+    checked_output(&mut command, action)
+}
+
+fn parse_remote_zellij_state(stdout: &str) -> Result<RemoteZellijState> {
+    match stdout.trim() {
+        "running" => Ok(RemoteZellijState::Running),
+        "exited" => Ok(RemoteZellijState::Exited),
+        "missing" => Ok(RemoteZellijState::Missing),
+        "legacy" => Ok(RemoteZellijState::LegacyTmux),
+        value => bail!("Unexpected remote Zellij state: {value}"),
+    }
+}
+
+pub fn remote_zellij_state(
+    name: &str,
+    uuid: &str,
+    github_login: &str,
+) -> Result<RemoteZellijState> {
+    parse_remote_zellij_state(&remote_launcher_output(
+        name,
+        github_login,
+        &["--state", uuid],
+        "Remote Zellij state query",
+    )?)
+}
+
+pub fn remote_zellij_ready(name: &str, uuid: &str, github_login: &str) -> Result<bool> {
+    match remote_launcher_output(
+        name,
+        github_login,
+        &["--ready", uuid],
+        "Remote Zellij readiness query",
+    )?
+    .trim()
+    {
+        "ready" => Ok(true),
+        "not-ready" => Ok(false),
+        value => bail!("Unexpected remote Zellij readiness: {value}"),
+    }
+}
+
+pub fn connect_zellij(
+    name: &str,
+    workdir: &str,
+    uuid: &str,
+    github_login: &str,
+    attach_only: bool,
+) -> Result<std::process::ExitStatus> {
+    validate_name(name)?;
+    validate_remote_workdir(workdir)?;
+    uuid::Uuid::parse_str(uuid).with_context(|| format!("Invalid UUID: {uuid}"))?;
+    ensure_account(github_login)?;
+    let remote_launcher = remote_launcher_path(name)?;
+    let remote_config = remote_config_path(name)?;
+    remote_launcher_output(
+        name,
+        github_login,
+        &["--clear-ready", uuid],
+        "Remote Zellij readiness reset",
+    )?;
+    let mut command = Command::new("gh");
+    command.args([
+        "codespace",
+        "ssh",
+        "--codespace",
+        name,
+        "--",
+        "-tt",
+        "sh",
+        &remote_launcher,
+    ]);
+    if attach_only {
+        command.args(["--attach", uuid, workdir, &remote_config]);
+    } else {
+        let remote_layout = remote_layout_path(name, uuid)?;
+        command.args(["--connect", uuid, workdir, &remote_layout, &remote_config]);
+    }
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to connect to remote Zellij")
+}
+
+pub fn cleanup_remote_zellij(name: &str, uuid: &str, github_login: &str) -> Result<()> {
+    remote_launcher_output(
+        name,
+        github_login,
+        &["--cleanup", uuid],
+        "Remote Zellij cleanup",
+    )?;
     Ok(())
 }
 
@@ -493,6 +680,40 @@ mod tests {
             "/tmp/csm-studious-space-123-launch-codespace.sh"
         );
         assert!(remote_launcher_path("unsafe name").is_err());
+    }
+
+    #[test]
+    fn remote_zellij_paths_are_codespace_specific() {
+        let uuid = "abcdef01-2345-6789-abcd-ef0123456789";
+        assert_eq!(
+            remote_layout_path("studious-space-123", uuid).unwrap(),
+            "/tmp/csm-studious-space-123-abcdef01.kdl"
+        );
+        assert_eq!(
+            remote_config_path("studious-space-123").unwrap(),
+            "/tmp/csm-studious-space-123-config.kdl"
+        );
+    }
+
+    #[test]
+    fn parses_remote_zellij_states() {
+        assert_eq!(
+            parse_remote_zellij_state("running\n").unwrap(),
+            RemoteZellijState::Running
+        );
+        assert_eq!(
+            parse_remote_zellij_state("exited\n").unwrap(),
+            RemoteZellijState::Exited
+        );
+        assert_eq!(
+            parse_remote_zellij_state("missing\n").unwrap(),
+            RemoteZellijState::Missing
+        );
+        assert_eq!(
+            parse_remote_zellij_state("legacy\n").unwrap(),
+            RemoteZellijState::LegacyTmux
+        );
+        assert!(parse_remote_zellij_state("unknown\n").is_err());
     }
 
     #[test]

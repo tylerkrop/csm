@@ -123,10 +123,7 @@ pub fn format_session_line(
 pub fn status_rank(s: &str) -> u8 {
     match s.split('/').next().unwrap_or(s) {
         "running" => 0,
-        "exited" => 1,
-        "stopped" => 2,
-        "removed" => 3,
-        _ => 4,
+        _ => 1,
     }
 }
 
@@ -230,9 +227,9 @@ mod tests {
     #[test]
     fn status_rank_ordering() {
         assert!(status_rank("running") < status_rank("exited"));
-        assert!(status_rank("exited") < status_rank("stopped"));
-        assert!(status_rank("stopped") < status_rank("removed"));
-        assert!(status_rank("removed") < status_rank("anything else"));
+        assert_eq!(status_rank("exited"), status_rank("stopped"));
+        assert_eq!(status_rank("stopped"), status_rank("removed"));
+        assert_eq!(status_rank("removed"), status_rank("anything else"));
         assert_eq!(status_rank("running/available"), status_rank("running"));
         assert_eq!(status_rank("stopped/shutdown"), status_rank("stopped"));
     }

@@ -58,6 +58,14 @@ struct CodespaceDetails<'a> {
     github_login: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodespaceEnterOutcome {
+    Detached,
+    Exited,
+    Shutdown,
+    LegacyTmux,
+}
+
 fn codespace_details(session: &session::Model) -> Result<CodespaceDetails<'_>> {
     let name = session
         .codespace_name
@@ -78,6 +86,15 @@ fn codespace_details(session: &session::Model) -> Result<CodespaceDetails<'_>> {
         workdir,
         github_login,
     })
+}
+
+fn legacy_tmux_error(codespace_name: &str, uuid: &str) -> anyhow::Error {
+    let tmux_name = format!("csm-{}", display::short_uuid(uuid));
+    anyhow::anyhow!(
+        "Legacy tmux session '{tmux_name}' is still running. Preserve its work by attaching with \
+         `gh codespace ssh -c {codespace_name} -- -tt tmux attach -t {tmux_name}`, then exit it \
+         before starting remote Zellij."
+    )
 }
 
 /// Prompt the user for a yes/no answer on stderr, reading a line from stdin.
@@ -154,7 +171,7 @@ async fn resolve_session(db: &DatabaseConnection, query: &str) -> Result<session
 /// Run the zellij client, then update last_used_at when the user detaches.
 /// If the user quit zellij (Ctrl+q), cleans up the exited session so it
 /// shows as "stopped" rather than "exited" in `csm ls`.
-async fn enter_zellij(
+async fn enter_local_zellij(
     db: &DatabaseConnection,
     session_name: &str,
     zellij_name: &str,
@@ -183,27 +200,10 @@ async fn enter_zellij(
     }
 
     // A detached session remains running. Any other state means the user quit
-    // or the session exited, so clean it up and stop its remote Codespace.
+    // or the session exited, so clean it up.
     let zs = zellij::State::query();
-    if !zs.is_running(zellij_name) {
-        if zs.exists(zellij_name) {
-            zellij::cleanup(zellij_name);
-        }
-        if let Some(session) = &session
-            && session.backend == BACKEND_CODESPACE
-        {
-            let details = codespace_details(session)?;
-            eprintln!(
-                "Stopping Codespace '{}' after Zellij exited...",
-                details.name
-            );
-            if let Err(error) = codespace::stop(details.name, details.github_login) {
-                eprintln!(
-                    "Warning: failed to stop Codespace '{}' after Zellij exited: {error}",
-                    details.name
-                );
-            }
-        }
+    if !zs.is_running(zellij_name) && zs.exists(zellij_name) {
+        zellij::cleanup(zellij_name);
     }
 
     Ok(())
@@ -243,26 +243,83 @@ async fn start_local_zellij_session(
         .args(["-s", zellij_name, "-n"])
         .arg(&layout)
         .current_dir(worktree);
-    enter_zellij(db, session_name, zellij_name, uuid, cmd).await
+    enter_local_zellij(db, session_name, zellij_name, uuid, cmd).await
 }
 
-async fn start_codespace_zellij_session(
+async fn enter_codespace_zellij(
     db: &DatabaseConnection,
-    session_name: &str,
-    zellij_name: &str,
-    uuid: &str,
-    codespace_name: &str,
-    remote_workdir: &str,
-) -> Result<()> {
-    let layout = zellij::ensure_codespace_layout(uuid, codespace_name, remote_workdir)?;
-    let config = zellij::ensure_config()?;
-    let mut cmd = Command::new("zellij");
-    cmd.arg("--config")
-        .arg(&config)
-        .args(["-s", zellij_name, "-n"])
-        .arg(&layout)
-        .current_dir(csm_dir()?);
-    enter_zellij(db, session_name, zellij_name, uuid, cmd).await
+    session: &session::Model,
+    attach_only: bool,
+) -> Result<CodespaceEnterOutcome> {
+    let details = codespace_details(session)?;
+    let codespace_name = details.name.to_string();
+    let remote_workdir = details.workdir.to_string();
+    let github_login = details.github_login.to_string();
+    let uuid = session.copilot_uuid.clone();
+    let session_name = session.name.clone();
+    let status = codespace::connect_zellij(
+        &codespace_name,
+        &remote_workdir,
+        &uuid,
+        &github_login,
+        attach_only,
+    )?;
+
+    if let Some(session) = Session::find()
+        .filter(Column::CopilotUuid.eq(&uuid))
+        .one(db)
+        .await?
+    {
+        let mut active: ActiveModel = session.into();
+        active.last_used_at = Set(now_str());
+        active.update(db).await?;
+    } else {
+        eprintln!(
+            "Warning: session '{session_name}' missing from database after remote Zellij exited."
+        );
+    }
+
+    let codespace_state = codespace::current_state(&codespace_name, &github_login)?;
+    if codespace_state.eq_ignore_ascii_case("shutdown") {
+        return Ok(CodespaceEnterOutcome::Shutdown);
+    }
+
+    let state_after = codespace::remote_zellij_state(&codespace_name, &uuid, &github_login)?;
+    match state_after {
+        codespace::RemoteZellijState::Running => {
+            if !codespace::remote_zellij_ready(&codespace_name, &uuid, &github_login)? {
+                let _ = codespace::stop(&codespace_name, &github_login);
+                bail!("Remote Zellij is running without the required ai/git/edit layout")
+            }
+            if !status.success() {
+                eprintln!(
+                    "Warning: SSH exited with {status}, but remote Zellij session '{}' is still running.",
+                    display::short_uuid(&uuid)
+                );
+            }
+            Ok(CodespaceEnterOutcome::Detached)
+        }
+        codespace::RemoteZellijState::Exited => {
+            let _ = codespace::cleanup_remote_zellij(&codespace_name, &uuid, &github_login);
+            eprintln!("Stopping Codespace '{codespace_name}' after remote Zellij exited...");
+            codespace::stop(&codespace_name, &github_login)?;
+            if status.success() {
+                Ok(CodespaceEnterOutcome::Exited)
+            } else {
+                bail!("SSH exited with {status} after remote Zellij exited")
+            }
+        }
+        codespace::RemoteZellijState::Missing => {
+            eprintln!("Stopping Codespace '{codespace_name}' after remote Zellij closed...");
+            codespace::stop(&codespace_name, &github_login)?;
+            if status.success() {
+                Ok(CodespaceEnterOutcome::Exited)
+            } else {
+                bail!("SSH exited with {status} and remote Zellij is missing")
+            }
+        }
+        codespace::RemoteZellijState::LegacyTmux => Ok(CodespaceEnterOutcome::LegacyTmux),
+    }
 }
 
 async fn cleanup_failed_codespace_creation(
@@ -359,12 +416,7 @@ async fn cleanup_failed_codespace_creation(
     }
 }
 
-async fn run_codespace(
-    db: &DatabaseConnection,
-    session_name: &str,
-    uuid: &str,
-    zellij_name: &str,
-) -> Result<()> {
+async fn run_codespace(db: &DatabaseConnection, session_name: &str, uuid: &str) -> Result<()> {
     let repo_root =
         git::repo_root().context("Codespace sessions must be created from a Git repository")?;
     codespace::check_auth()?;
@@ -392,65 +444,75 @@ async fn run_codespace(
         status: Set(STATUS_ACTIVE.to_string()),
         last_used_at: Set(now_str()),
     };
-    if let Err(error) = model.insert(db).await {
-        cleanup_failed_codespace_creation(
-            db,
-            session_name,
-            uuid,
-            &repo,
-            &codespace_name,
-            &remote_workdir,
-            &github_login,
-        )
-        .await;
-        return Err(error.into());
-    }
+    let session = match model.insert(db).await {
+        Ok(session) => session,
+        Err(error) => {
+            cleanup_failed_codespace_creation(
+                db,
+                session_name,
+                uuid,
+                &repo,
+                &codespace_name,
+                &remote_workdir,
+                &github_login,
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
 
-    let setup_result = (|| -> Result<()> {
+    let setup_result = (|| -> Result<codespace::RemoteSetupOutcome> {
         let launcher = zellij::ensure_codespace_launcher()?;
-        codespace::prepare_remote(&codespace_name, &remote_workdir, &launcher, &github_login)?;
-        Ok(())
-    })();
-    if let Err(error) = setup_result {
-        cleanup_failed_codespace_creation(
-            db,
-            session_name,
+        let layout = zellij::ensure_codespace_layout(uuid, &codespace_name)?;
+        let config = zellij::ensure_config()?;
+        codespace::prepare_remote(codespace::RemoteSetup {
+            name: &codespace_name,
+            workdir: &remote_workdir,
+            launcher: &launcher,
+            layout: &layout,
+            config: &config,
             uuid,
-            &repo,
-            &codespace_name,
-            &remote_workdir,
-            &github_login,
-        )
-        .await;
-        return Err(error);
+            resume: false,
+            github_login: &github_login,
+        })
+    })();
+    match setup_result {
+        Ok(codespace::RemoteSetupOutcome::Ready) => {}
+        Ok(codespace::RemoteSetupOutcome::LegacyTmux) => {
+            return Err(legacy_tmux_error(&codespace_name, uuid));
+        }
+        Err(error) => {
+            cleanup_failed_codespace_creation(
+                db,
+                session_name,
+                uuid,
+                &repo,
+                &codespace_name,
+                &remote_workdir,
+                &github_login,
+            )
+            .await;
+            return Err(error);
+        }
     }
 
     eprintln!(
         "Created Codespace session '{session_name}' (codespace: {codespace_name}, uuid: {uuid})"
     );
-    eprintln!("Opening Codespace session in Zellij...");
-    let result = start_codespace_zellij_session(
-        db,
-        session_name,
-        zellij_name,
-        uuid,
-        &codespace_name,
-        &remote_workdir,
-    )
-    .await;
-    if result.is_err() {
-        cleanup_failed_codespace_creation(
-            db,
-            session_name,
-            uuid,
-            &repo,
-            &codespace_name,
-            &remote_workdir,
-            &github_login,
-        )
-        .await;
+    eprintln!("Connecting directly to remote Zellij...");
+    match enter_codespace_zellij(db, &session, false).await {
+        Ok(CodespaceEnterOutcome::LegacyTmux) => Err(legacy_tmux_error(&codespace_name, uuid)),
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if let Err(stop_error) = codespace::stop(&codespace_name, &github_login) {
+                eprintln!(
+                    "Warning: failed to stop Codespace '{codespace_name}' after connection failed: \
+                     {stop_error}"
+                );
+            }
+            Err(error)
+        }
     }
-    result
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -488,7 +550,7 @@ pub async fn run(name: &str, here: bool, use_codespace: bool) -> Result<()> {
     let zellij_name = display::short_uuid(&uuid);
 
     if use_codespace {
-        return run_codespace(&db, &session_name, &uuid, &zellij_name).await;
+        return run_codespace(&db, &session_name, &uuid).await;
     }
 
     let dir = csm_dir()?;
@@ -626,17 +688,17 @@ pub async fn start(name: &str) -> Result<()> {
         bail!("Session '{sname}' has been removed. Use `csm restore {sname}` to recover.");
     }
 
-    let zs = zellij::State::query();
-    if zs.is_running(&zname) {
-        bail!("Session '{sname}' is already running. Use `csm attach {sname}` to connect.");
-    }
-    if zs.exists(&zname) {
-        zellij::cleanup(&zname);
-    }
-
     let uuid = session.copilot_uuid.clone();
     match session.backend.as_str() {
         BACKEND_LOCAL => {
+            let zs = zellij::State::query();
+            if zs.is_running(&zname) {
+                bail!("Session '{sname}' is already running. Use `csm attach {sname}` to connect.");
+            }
+            if zs.exists(&zname) {
+                zellij::cleanup(&zname);
+            }
+
             let worktree = session.worktree_path.clone();
             let mut active: ActiveModel = session.into();
             active.last_used_at = Set(now_str());
@@ -653,44 +715,93 @@ pub async fn start(name: &str) -> Result<()> {
             let remote_workdir = details.workdir.to_string();
             let github_login = details.github_login.to_string();
             let initial_state = codespace::current_state(&codespace_name, &github_login)?;
-            let result = async {
+            let setup_result = (|| -> Result<codespace::RemoteSetupOutcome> {
                 let launcher = zellij::ensure_codespace_launcher()?;
-                codespace::prepare_remote(
-                    &codespace_name,
-                    &remote_workdir,
-                    &launcher,
-                    &github_login,
-                )?;
-
-                let mut active: ActiveModel = session.into();
-                active.last_used_at = Set(now_str());
-                active.update(&db).await?;
-
-                eprintln!(
-                    "Starting Codespace session '{sname}' (codespace: {codespace_name}, uuid: {uuid})"
-                );
-                start_codespace_zellij_session(
-                    &db,
-                    &sname,
-                    &zname,
-                    &uuid,
-                    &codespace_name,
-                    &remote_workdir,
-                )
-                .await
+                let layout = zellij::ensure_codespace_layout(&uuid, &codespace_name)?;
+                let config = zellij::ensure_config()?;
+                codespace::prepare_remote(codespace::RemoteSetup {
+                    name: &codespace_name,
+                    workdir: &remote_workdir,
+                    launcher: &launcher,
+                    layout: &layout,
+                    config: &config,
+                    uuid: &uuid,
+                    resume: true,
+                    github_login: &github_login,
+                })
+            })();
+            match setup_result {
+                Ok(codespace::RemoteSetupOutcome::Ready) => {}
+                Ok(codespace::RemoteSetupOutcome::LegacyTmux) => {
+                    return Err(legacy_tmux_error(&codespace_name, &uuid));
+                }
+                Err(error) => {
+                    if initial_state.eq_ignore_ascii_case("shutdown")
+                        && let Err(stop_error) = codespace::stop(&codespace_name, &github_login)
+                    {
+                        eprintln!(
+                            "Warning: failed to stop Codespace '{codespace_name}' after setup \
+                             failed: {stop_error}"
+                        );
+                    }
+                    return Err(error);
+                }
             }
-            .await
-            ;
-            if result.is_err()
-                && initial_state.eq_ignore_ascii_case("shutdown")
-                && let Err(error) = codespace::stop(&codespace_name, &github_login)
-            {
-                eprintln!(
-                    "Warning: failed to stop Codespace '{codespace_name}' after startup failed: \
-                     {error}"
-                );
+
+            let remote_state =
+                match codespace::remote_zellij_state(&codespace_name, &uuid, &github_login) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        if initial_state.eq_ignore_ascii_case("shutdown")
+                            && let Err(stop_error) = codespace::stop(&codespace_name, &github_login)
+                        {
+                            eprintln!(
+                                "Warning: failed to stop Codespace '{codespace_name}' after state \
+                                 check failed: {stop_error}"
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+            if remote_state == codespace::RemoteZellijState::Running {
+                bail!("Session '{sname}' is already running. Use `csm attach {sname}` to connect.");
             }
-            result
+            if remote_state == codespace::RemoteZellijState::LegacyTmux {
+                return Err(legacy_tmux_error(&codespace_name, &uuid));
+            }
+
+            let mut active: ActiveModel = session.clone().into();
+            active.last_used_at = Set(now_str());
+            if let Err(error) = active.update(&db).await {
+                if initial_state.eq_ignore_ascii_case("shutdown")
+                    && let Err(stop_error) = codespace::stop(&codespace_name, &github_login)
+                {
+                    eprintln!(
+                        "Warning: failed to stop Codespace '{codespace_name}' after database \
+                         update failed: {stop_error}"
+                    );
+                }
+                return Err(error.into());
+            }
+
+            eprintln!(
+                "Starting remote Zellij session '{sname}' (codespace: {codespace_name}, uuid: {uuid})"
+            );
+            match enter_codespace_zellij(&db, &session, false).await {
+                Ok(CodespaceEnterOutcome::LegacyTmux) => {
+                    Err(legacy_tmux_error(&codespace_name, &uuid))
+                }
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    if let Err(stop_error) = codespace::stop(&codespace_name, &github_login) {
+                        eprintln!(
+                            "Warning: failed to stop Codespace '{codespace_name}' after start \
+                             failed: {stop_error}"
+                        );
+                    }
+                    Err(error)
+                }
+            }
         }
         backend => bail!("Session '{sname}' has unknown backend '{backend}'"),
     }
@@ -706,19 +817,66 @@ pub async fn attach(name: &str) -> Result<()> {
         bail!("Session '{sname}' has been removed. Use `csm restore {sname}` to recover.");
     }
 
-    let zs = zellij::State::query();
-    if !zs.is_running(&zname) {
-        bail!("Session '{sname}' is not running. Use `csm start {sname}` first.");
-    }
-
     let uuid = session.copilot_uuid.clone();
-    let mut active: ActiveModel = session.into();
-    active.last_used_at = Set(now_str());
-    active.update(&db).await?;
+    match session.backend.as_str() {
+        BACKEND_LOCAL => {
+            let zs = zellij::State::query();
+            if !zs.is_running(&zname) {
+                bail!("Session '{sname}' is not running. Use `csm start {sname}` first.");
+            }
 
-    let mut cmd = Command::new("zellij");
-    cmd.args(["attach", zname.as_str()]);
-    enter_zellij(&db, &sname, &zname, &uuid, cmd).await
+            let mut active: ActiveModel = session.into();
+            active.last_used_at = Set(now_str());
+            active.update(&db).await?;
+
+            let mut cmd = Command::new("zellij");
+            cmd.args(["attach", zname.as_str()]);
+            enter_local_zellij(&db, &sname, &zname, &uuid, cmd).await
+        }
+        BACKEND_CODESPACE => {
+            let details = codespace_details(&session)?;
+            let codespace_state = codespace::current_state(details.name, details.github_login)?;
+            if codespace_state.eq_ignore_ascii_case("shutdown") {
+                bail!("Session '{sname}' is stopped. Use `csm start {sname}` first.");
+            }
+
+            let launcher = zellij::ensure_codespace_launcher()?;
+            let layout = zellij::ensure_codespace_layout(&uuid, details.name)?;
+            let config = zellij::ensure_config()?;
+            let setup_outcome = codespace::prepare_remote(codespace::RemoteSetup {
+                name: details.name,
+                workdir: details.workdir,
+                launcher: &launcher,
+                layout: &layout,
+                config: &config,
+                uuid: &uuid,
+                resume: true,
+                github_login: details.github_login,
+            })?;
+            if setup_outcome == codespace::RemoteSetupOutcome::LegacyTmux {
+                return Err(legacy_tmux_error(details.name, &uuid));
+            }
+            match codespace::remote_zellij_state(details.name, &uuid, details.github_login)? {
+                codespace::RemoteZellijState::Running => {}
+                codespace::RemoteZellijState::LegacyTmux => {
+                    return Err(legacy_tmux_error(details.name, &uuid));
+                }
+                _ => {
+                    bail!("Session '{sname}' is not running. Use `csm start {sname}` first.");
+                }
+            }
+
+            eprintln!(
+                "Attaching to remote Zellij session '{sname}' (codespace: {})",
+                details.name
+            );
+            match enter_codespace_zellij(&db, &session, true).await? {
+                CodespaceEnterOutcome::LegacyTmux => Err(legacy_tmux_error(details.name, &uuid)),
+                _ => Ok(()),
+            }
+        }
+        backend => bail!("Session '{sname}' has unknown backend '{backend}'"),
+    }
 }
 
 pub async fn stop(names: &[String]) -> Result<()> {
@@ -918,6 +1076,18 @@ async fn delete_session_by_uuid(db: &DatabaseConnection, uuid: &str) -> Result<(
     }
 }
 
+async fn mark_session_removed(db: &DatabaseConnection, uuid: &str) -> Result<()> {
+    let session = Session::find()
+        .filter(Column::CopilotUuid.eq(uuid))
+        .one(db)
+        .await?
+        .with_context(|| format!("Session with UUID '{uuid}' disappeared"))?;
+    let mut active: ActiveModel = session.into();
+    active.status = Set(STATUS_REMOVED.to_string());
+    active.update(db).await?;
+    Ok(())
+}
+
 /// Remove (or, with `force`, destroy) a single resolved session.
 async fn remove_one(
     db: &DatabaseConnection,
@@ -1001,17 +1171,38 @@ async fn remove_one(
 
 struct CodespaceStates {
     values: HashMap<String, codespace::RemoteState>,
+    zellij_values: HashMap<String, codespace::RemoteZellijState>,
     query_succeeded: bool,
     current_login: Option<String>,
 }
 
-fn load_codespace_states(sessions: &[session::Model]) -> CodespaceStates {
+fn load_codespace_states(
+    sessions: &[session::Model],
+    local_zellij: &zellij::State,
+) -> CodespaceStates {
+    let local_zellij_values: HashMap<String, codespace::RemoteZellijState> = sessions
+        .iter()
+        .filter(|session| session.backend == BACKEND_CODESPACE)
+        .filter_map(|session| {
+            let codespace_name = session.codespace_name.clone()?;
+            let zellij_name = zellij_session_name(session);
+            if local_zellij.is_running(&zellij_name) {
+                Some((codespace_name, codespace::RemoteZellijState::Running))
+            } else if local_zellij.exists(&zellij_name) {
+                Some((codespace_name, codespace::RemoteZellijState::Exited))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     if !sessions
         .iter()
         .any(|session| session.backend == BACKEND_CODESPACE)
     {
         return CodespaceStates {
             values: HashMap::new(),
+            zellij_values: local_zellij_values,
             query_succeeded: true,
             current_login: None,
         };
@@ -1022,21 +1213,68 @@ fn load_codespace_states(sessions: &[session::Model]) -> CodespaceStates {
             eprintln!("Warning: could not determine the active GitHub account: {error}");
             return CodespaceStates {
                 values: HashMap::new(),
+                zellij_values: local_zellij_values,
                 query_succeeded: false,
                 current_login: None,
             };
         }
     };
     match codespace::list_states() {
-        Ok(values) => CodespaceStates {
-            values,
-            query_succeeded: true,
-            current_login: Some(current_login),
-        },
+        Ok(values) => {
+            let mut zellij_values = local_zellij_values;
+            for session in sessions {
+                if session.status == STATUS_REMOVED || session.backend != BACKEND_CODESPACE {
+                    continue;
+                }
+                let Ok(details) = codespace_details(session) else {
+                    continue;
+                };
+                if details.github_login != current_login
+                    || !values
+                        .get(details.name)
+                        .is_some_and(|state| state.state.eq_ignore_ascii_case("available"))
+                {
+                    continue;
+                }
+
+                let state = if zellij_values.get(details.name)
+                    == Some(&codespace::RemoteZellijState::Running)
+                {
+                    None
+                } else {
+                    match codespace::remote_zellij_state(
+                        details.name,
+                        &session.copilot_uuid,
+                        details.github_login,
+                    ) {
+                        Ok(state) => Some(state),
+                        Err(error) => {
+                            eprintln!(
+                                "Warning: could not query Zellij state for Codespace session '{}': \
+                                 {error}",
+                                session.name
+                            );
+                            None
+                        }
+                    }
+                };
+                if let Some(state) = state {
+                    zellij_values.insert(details.name.to_string(), state);
+                }
+            }
+
+            CodespaceStates {
+                values,
+                zellij_values,
+                query_succeeded: true,
+                current_login: Some(current_login),
+            }
+        }
         Err(error) => {
             eprintln!("Warning: could not query Codespace states: {error}");
             CodespaceStates {
                 values: HashMap::new(),
+                zellij_values: local_zellij_values,
                 query_succeeded: false,
                 current_login: Some(current_login),
             }
@@ -1088,15 +1326,21 @@ fn session_display_status(
     }
 
     let zellij_name = zellij_session_name(session);
-    let local_status = zellij_state.display_status(&zellij_name);
     match session.backend.as_str() {
-        BACKEND_LOCAL => Ok(local_status.to_string()),
+        BACKEND_LOCAL => Ok(zellij_state.display_status(&zellij_name).to_string()),
         BACKEND_CODESPACE => {
             let details = codespace_details(session)?;
+            let observed_zellij = codespace_states.zellij_values.get(details.name);
             if let Some(current_login) = codespace_states.current_login.as_deref()
                 && current_login != details.github_login
             {
-                return Ok(format!("{local_status}/account:{}", details.github_login));
+                let zellij_status = match observed_zellij {
+                    Some(codespace::RemoteZellijState::Running)
+                    | Some(codespace::RemoteZellijState::LegacyTmux) => "running",
+                    Some(codespace::RemoteZellijState::Exited) => "exited",
+                    Some(codespace::RemoteZellijState::Missing) | None => "unknown",
+                };
+                return Ok(format!("{zellij_status}/account:{}", details.github_login));
             }
             let remote_status = codespace_states
                 .values
@@ -1109,7 +1353,17 @@ fn session_display_status(
                         "unknown".to_string()
                     }
                 });
-            Ok(format!("{local_status}/{remote_status}"))
+            let zellij_status = match observed_zellij {
+                Some(codespace::RemoteZellijState::Running)
+                | Some(codespace::RemoteZellijState::LegacyTmux) => "running",
+                Some(codespace::RemoteZellijState::Exited) => "exited",
+                Some(codespace::RemoteZellijState::Missing) => "stopped",
+                None => match remote_status.as_str() {
+                    "shutdown" | "missing" => "stopped",
+                    _ => "unknown",
+                },
+            };
+            Ok(format!("{zellij_status}/{remote_status}"))
         }
         backend => bail!("Session '{}' has unknown backend '{backend}'", session.name),
     }
@@ -1137,7 +1391,7 @@ async fn interactive_remove_candidates(db: &DatabaseConnection) -> Result<Vec<in
         .collect();
 
     let zs = zellij::State::query();
-    let codespace_states = load_codespace_states(&sessions);
+    let codespace_states = load_codespace_states(&sessions, &zs);
     let mut entries: Vec<(&session::Model, String)> = sessions
         .iter()
         .map(|session| {
@@ -1220,7 +1474,7 @@ pub async fn list(show_all: bool) -> Result<()> {
 
     let color = display::use_color();
     let zs = zellij::State::query();
-    let codespace_states = load_codespace_states(&sessions);
+    let codespace_states = load_codespace_states(&sessions, &zs);
 
     let mut entries: Vec<(&session::Model, String)> = sessions
         .iter()
@@ -1306,64 +1560,101 @@ pub async fn restore(name: &str) -> Result<()> {
             let remote_workdir = details.workdir.to_string();
             let github_login = details.github_login.to_string();
             let initial_state = codespace::current_state(&codespace_name, &github_login)?;
-            let result = async {
+            let setup_result = (|| -> Result<codespace::RemoteSetupOutcome> {
                 let launcher = zellij::ensure_codespace_launcher()?;
-                codespace::prepare_remote(
-                    &codespace_name,
-                    &remote_workdir,
-                    &launcher,
-                    &github_login,
-                )?;
-
-                let mut active: ActiveModel = session.into();
-                active.status = Set(STATUS_ACTIVE.to_string());
-                active.last_used_at = Set(now_str());
-                active.update(&db).await?;
-
-                eprintln!(
-                    "Restored Codespace session '{sname}' (codespace: {codespace_name}, uuid: {uuid})"
-                );
-                start_codespace_zellij_session(
-                    &db,
-                    &sname,
-                    &zname,
-                    &uuid,
-                    &codespace_name,
-                    &remote_workdir,
-                )
-                .await
-            }
-            .await
-            ;
-            if result.is_err() {
-                match Session::find_by_id(&sname).one(&db).await {
-                    Ok(Some(session)) => {
-                        let mut active: ActiveModel = session.into();
-                        active.status = Set(STATUS_REMOVED.to_string());
-                        if let Err(error) = active.update(&db).await {
-                            eprintln!(
-                                "Warning: failed to return session '{sname}' to removed state: \
-                                 {error}"
-                            );
-                        }
-                    }
-                    Ok(None) => eprintln!(
-                        "Warning: session '{sname}' disappeared while restoring its Codespace."
-                    ),
-                    Err(error) => eprintln!(
-                        "Warning: failed to reload session '{sname}' after restore failed: {error}"
-                    ),
+                let layout = zellij::ensure_codespace_layout(&uuid, &codespace_name)?;
+                let config = zellij::ensure_config()?;
+                codespace::prepare_remote(codespace::RemoteSetup {
+                    name: &codespace_name,
+                    workdir: &remote_workdir,
+                    launcher: &launcher,
+                    layout: &layout,
+                    config: &config,
+                    uuid: &uuid,
+                    resume: true,
+                    github_login: &github_login,
+                })
+            })();
+            match setup_result {
+                Ok(codespace::RemoteSetupOutcome::Ready) => {}
+                Ok(codespace::RemoteSetupOutcome::LegacyTmux) => {
+                    return Err(legacy_tmux_error(&codespace_name, &uuid));
                 }
+                Err(error) => {
+                    if initial_state.eq_ignore_ascii_case("shutdown")
+                        && let Err(stop_error) = codespace::stop(&codespace_name, &github_login)
+                    {
+                        eprintln!(
+                            "Warning: failed to stop Codespace '{codespace_name}' after restore \
+                             setup failed: {stop_error}"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+
+            let remote_state = match codespace::remote_zellij_state(
+                &codespace_name,
+                &uuid,
+                &github_login,
+            ) {
+                Ok(state) => state,
+                Err(error) => {
+                    if initial_state.eq_ignore_ascii_case("shutdown")
+                        && let Err(stop_error) = codespace::stop(&codespace_name, &github_login)
+                    {
+                        eprintln!(
+                            "Warning: failed to stop Codespace '{codespace_name}' after restore \
+                                 state check failed: {stop_error}"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if remote_state == codespace::RemoteZellijState::LegacyTmux {
+                return Err(legacy_tmux_error(&codespace_name, &uuid));
+            }
+
+            let mut active: ActiveModel = session.clone().into();
+            active.status = Set(STATUS_ACTIVE.to_string());
+            active.last_used_at = Set(now_str());
+            if let Err(error) = active.update(&db).await {
                 if initial_state.eq_ignore_ascii_case("shutdown")
-                    && let Err(error) = codespace::stop(&codespace_name, &github_login)
+                    && let Err(stop_error) = codespace::stop(&codespace_name, &github_login)
                 {
                     eprintln!(
-                        "Warning: failed to stop Codespace '{codespace_name}' after restore failed: \
-                         {error}"
+                        "Warning: failed to stop Codespace '{codespace_name}' after restore \
+                         database update failed: {stop_error}"
                     );
                 }
+                return Err(error.into());
             }
-            result
+
+            eprintln!(
+                "Restored remote Zellij session '{sname}' (codespace: {codespace_name}, uuid: {uuid})"
+            );
+            match enter_codespace_zellij(&db, &session, false).await {
+                Ok(CodespaceEnterOutcome::LegacyTmux) => {
+                    mark_session_removed(&db, &uuid).await?;
+                    Err(legacy_tmux_error(&codespace_name, &uuid))
+                }
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    if let Err(mark_error) = mark_session_removed(&db, &uuid).await {
+                        eprintln!(
+                            "Warning: failed to return session '{sname}' to removed state after \
+                             connection failed: {mark_error}"
+                        );
+                    }
+                    if let Err(stop_error) = codespace::stop(&codespace_name, &github_login) {
+                        eprintln!(
+                            "Warning: failed to stop Codespace '{codespace_name}' after restore \
+                             connection failed: {stop_error}"
+                        );
+                    }
+                    Err(error)
+                }
+            }
         }
         backend => bail!("Session '{sname}' has unknown backend '{backend}'"),
     }
@@ -1422,13 +1713,22 @@ pub async fn rename(old: &str, new_name: &str) -> Result<()> {
     new_session.insert(&txn).await?;
     txn.commit().await?;
 
-    let zs = zellij::State::query();
-    let running = if zs.is_running(&zname) {
-        " (still running)"
-    } else {
-        ""
+    let suffix = match session.backend.as_str() {
+        BACKEND_LOCAL if zellij::State::query().is_running(&zname) => " (still running)",
+        BACKEND_LOCAL => "",
+        BACKEND_CODESPACE => {
+            let details = codespace_details(&session)?;
+            if codespace::current_state(details.name, details.github_login)
+                .is_ok_and(|state| state.eq_ignore_ascii_case("available"))
+            {
+                " (Codespace available)"
+            } else {
+                ""
+            }
+        }
+        backend => bail!("Session '{new_name}' has unknown backend '{backend}'"),
     };
-    println!("Renamed session '{old_name}' → '{new_name}'{running}");
+    println!("Renamed session '{old_name}' → '{new_name}'{suffix}");
     Ok(())
 }
 
