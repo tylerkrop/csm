@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use tracing::debug;
 
 /// Get the root directory of the current git repository.
 pub fn repo_root() -> Result<String> {
@@ -51,6 +52,7 @@ pub fn branch_exists(branch: &str, source_repo: Option<&str>) -> bool {
 /// Run `git pull` in the given repository. Returns an error if git fails so
 /// callers can decide whether to warn or abort.
 pub fn pull(repo: &str) -> Result<()> {
+    debug!(repository = repo, "Pulling Git repository");
     let out = Command::new("git")
         .args(["-C", repo, "pull"])
         .output()
@@ -72,6 +74,13 @@ pub fn create_worktree(
     new_branch: bool,
     source_repo: Option<&str>,
 ) -> Result<()> {
+    debug!(
+        worktree.path = worktree_path,
+        branch,
+        new_branch,
+        repository = source_repo.unwrap_or(""),
+        "Creating Git worktree"
+    );
     if let Some(parent) = std::path::Path::new(worktree_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -100,6 +109,11 @@ pub fn create_worktree(
 /// Remove a worktree, falling back to directory removal + prune.
 /// Returns Err if the worktree directory still exists after both attempts.
 pub fn remove_worktree(source_repo: &str, worktree_path: &str) -> Result<()> {
+    debug!(
+        repository = source_repo,
+        worktree.path = worktree_path,
+        "Removing Git worktree"
+    );
     let git_result = Command::new("git")
         .args([
             "-C",

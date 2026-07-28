@@ -13,6 +13,10 @@ pub struct Model {
     pub codespace_name: Option<String>,
     pub remote_workdir: Option<String>,
     pub github_login: Option<String>,
+    pub cached_codespace_state: Option<String>,
+    pub cached_codespace_branch: Option<String>,
+    pub cached_zellij_state: Option<String>,
+    pub codespace_state_updated_at: Option<String>,
     pub status: String,
     pub last_used_at: String,
 }

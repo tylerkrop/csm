@@ -1,5 +1,9 @@
+use std::future::Future;
+use std::process::ExitCode;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tracing::Instrument;
 
 mod codespace;
 mod commands;
@@ -8,6 +12,7 @@ mod display;
 mod entity;
 mod git;
 mod interactive;
+mod logging;
 mod zellij;
 
 #[derive(Parser)]
@@ -74,6 +79,9 @@ enum Commands {
         /// Show all sessions including removed
         #[arg(short, long)]
         all: bool,
+        /// Refresh cached Codespace and remote Zellij status before listing
+        #[arg(long)]
+        refresh: bool,
     },
     /// Restore a previously removed session
     Restore {
@@ -91,27 +99,152 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let logging = match logging::init() {
+        Ok(logging) => logging,
+        Err(error) => {
+            eprintln!("Failed to initialize logging: {error:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = run(cli).await;
+    let exit_code = match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    };
+    drop(logging);
+    exit_code
+}
 
+async fn logged_command<F>(span: tracing::Span, future: F) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    async move {
+        let result = future.await;
+        match &result {
+            Ok(()) => tracing::debug!("Command completed"),
+            Err(error) => tracing::error!(error = %format!("{error:#}"), "Command failed"),
+        }
+        result
+    }
+    .instrument(span)
+    .await
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    let process_id = std::process::id();
     match cli.command {
         Commands::Run {
             name,
             here,
             codespace,
-        } => commands::run(&name, here, codespace).await,
-        Commands::Start { name } => commands::start(&name).await,
-        Commands::Attach { name } => commands::attach(&name).await,
-        Commands::Stop { names } => commands::stop(&names).await,
+        } => {
+            let span = tracing::debug_span!(
+                "command",
+                process.id = process_id,
+                command = "run",
+                session.query = %name,
+                session.name = tracing::field::Empty,
+                session.uuid = tracing::field::Empty,
+                session.backend = tracing::field::Empty,
+                here,
+                codespace
+            );
+            logged_command(span, commands::run(&name, here, codespace)).await
+        }
+        Commands::Start { name } => {
+            let span = tracing::debug_span!(
+                "command",
+                process.id = process_id,
+                command = "start",
+                session.query = %name,
+                session.name = tracing::field::Empty,
+                session.uuid = tracing::field::Empty,
+                session.backend = tracing::field::Empty
+            );
+            logged_command(span, commands::start(&name)).await
+        }
+        Commands::Attach { name } => {
+            let span = tracing::debug_span!(
+                "command",
+                process.id = process_id,
+                command = "attach",
+                session.query = %name,
+                session.name = tracing::field::Empty,
+                session.uuid = tracing::field::Empty,
+                session.backend = tracing::field::Empty
+            );
+            logged_command(span, commands::attach(&name)).await
+        }
+        Commands::Stop { names } => {
+            let span = tracing::debug_span!(
+                "command",
+                process.id = process_id,
+                command = "stop",
+                session.queries = ?names,
+                session.name = tracing::field::Empty,
+                session.uuid = tracing::field::Empty,
+                session.backend = tracing::field::Empty
+            );
+            logged_command(span, commands::stop(&names)).await
+        }
         Commands::Remove {
             names,
             force,
             interactive,
             older_than,
-        } => commands::rm(&names, force, interactive, older_than).await,
-        Commands::List { all } => commands::list(all).await,
-        Commands::Restore { name } => commands::restore(&name).await,
-        Commands::Rename { old, new } => commands::rename(&old, &new).await,
+        } => {
+            let span = tracing::debug_span!(
+                "command",
+                process.id = process_id,
+                command = "remove",
+                session.queries = ?names,
+                session.name = tracing::field::Empty,
+                session.uuid = tracing::field::Empty,
+                session.backend = tracing::field::Empty,
+                force,
+                interactive,
+                older_than
+            );
+            logged_command(span, commands::rm(&names, force, interactive, older_than)).await
+        }
+        Commands::List { all, refresh } => {
+            let span = tracing::debug_span!(
+                "command",
+                process.id = process_id,
+                command = "list",
+                all,
+                refresh
+            );
+            logged_command(span, commands::list(all, refresh)).await
+        }
+        Commands::Restore { name } => {
+            let span = tracing::debug_span!(
+                "command",
+                process.id = process_id,
+                command = "restore",
+                session.query = %name,
+                session.name = tracing::field::Empty,
+                session.uuid = tracing::field::Empty,
+                session.backend = tracing::field::Empty
+            );
+            logged_command(span, commands::restore(&name)).await
+        }
+        Commands::Rename { old, new } => {
+            let span = tracing::debug_span!(
+                "command",
+                process.id = process_id,
+                command = "rename",
+                session.query = %old,
+                session.new_name = %new,
+                session.name = tracing::field::Empty,
+                session.uuid = tracing::field::Empty,
+                session.backend = tracing::field::Empty
+            );
+            logged_command(span, commands::rename(&old, &new)).await
+        }
     }
 }
 
@@ -135,5 +268,17 @@ mod tests {
     #[test]
     fn run_rejects_codespace_with_here() {
         assert!(Cli::try_parse_from(["csm", "run", "example", "--cs", "--here"]).is_err());
+    }
+
+    #[test]
+    fn list_accepts_refresh() {
+        let cli = Cli::try_parse_from(["csm", "list", "--refresh"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::List {
+                all: false,
+                refresh: true
+            }
+        ));
     }
 }

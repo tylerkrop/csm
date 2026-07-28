@@ -62,8 +62,6 @@ csm records the GitHub account that created each Codespace. If you later switch 
 
 The Codespace setup must provide both Zellij and Copilot CLI. csm verifies both commands after `gh codespace create -s` finishes.
 
-Sessions created by the earlier tmux-based Codespace flow are not terminated automatically. If csm detects a legacy tmux session, it prints the direct `gh codespace ssh ... tmux attach` command so its work can be preserved and exited before migration to remote Zellij.
-
 Session names must be alphanumeric and may contain `-` or `_`.
 
 ### List sessions
@@ -71,9 +69,10 @@ Session names must be alphanumeric and may contain `-` or `_`.
 ```sh
 csm list        # active sessions
 csm list -a     # include removed sessions
+csm list --refresh  # refresh cached Codespace status
 ```
 
-Shows the session shortcode, name, repository, branch, status (running/exited/stopped/removed), and last-used time. Codespace repositories have an `@cs` suffix and combine Zellij with Codespace state, such as `running/available` or `stopped/shutdown`. During migration, list also recognizes the local Zellij wrappers used by older tmux-based Codespace sessions. Sessions are sorted by status then most recently used.
+Shows the session shortcode, name, repository, branch, status (running/exited/stopped/removed), and last-used time. Codespace repositories have an `@cs` suffix and combine Zellij with Codespace state, such as `running/available` or `stopped/shutdown`. Codespace status is cached locally so normal lists do not contact GitHub; use `--refresh` for an authoritative update. Sessions are sorted by status then most recently used.
 
 ### Attach to a running session
 

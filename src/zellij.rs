@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use tracing::debug;
 
 /// Build the zellij layout KDL for a session. The `ai` tab runs the csm copilot
 /// launcher (`launcher`) as a command pane with the session `uuid` as its
@@ -105,11 +106,6 @@ export PATH="$HOME/.local/bin:$mise_shims:$PATH"
 
 session_state() {
     session_name="$1"
-    if command -v tmux >/dev/null 2>&1 \
-        && tmux has-session -t "csm-$session_name" 2>/dev/null; then
-        printf 'legacy\n'
-        return
-    fi
     sessions="$(zellij list-sessions -n 2>/dev/null || true)"
     line="$(printf '%s\n' "$sessions" | awk -v name="$session_name" '$1 == name { print; exit }')"
     if [ -z "$line" ]; then
@@ -232,10 +228,6 @@ case "$1" in
         config="$5"
         session_name="${uuid%%-*}"
         state="$(session_state "$session_name")"
-        if [ "$state" = "legacy" ]; then
-            printf 'Legacy tmux session is still running: csm-%s\n' "$session_name" >&2
-            exit 1
-        fi
         if [ "$state" = "running" ]; then
             ensure_tabs "$session_name" "$workdir" "$uuid" "$0"
             : > "/tmp/csm-zellij-$session_name.ready"
@@ -257,10 +249,6 @@ case "$1" in
         config="$4"
         session_name="${uuid%%-*}"
         state="$(session_state "$session_name")"
-        if [ "$state" = "legacy" ]; then
-            printf 'Legacy tmux session is still running: csm-%s\n' "$session_name" >&2
-            exit 1
-        fi
         if [ "$state" != "running" ]; then
             printf 'Remote Zellij session is not running: %s\n' "$session_name" >&2
             exit 1
@@ -328,6 +316,12 @@ pub fn ensure_layout(uuid: &str, launcher: &Path, include_git: bool) -> Result<P
     let launcher = launcher.to_string_lossy();
     std::fs::write(&path, layout_kdl(&launcher, uuid, include_git))
         .with_context(|| format!("Failed to write {}", path.display()))?;
+    debug!(
+        session.uuid = uuid,
+        layout.path = %path.display(),
+        include_git,
+        "Wrote local Zellij layout"
+    );
     Ok(path)
 }
 
@@ -341,6 +335,12 @@ pub fn ensure_codespace_layout(uuid: &str, codespace_name: &str) -> Result<PathB
     let path = dir.join(format!("{uuid}.kdl"));
     std::fs::write(&path, codespace_layout_kdl(uuid, &remote_launcher))
         .with_context(|| format!("Failed to write {}", path.display()))?;
+    debug!(
+        session.uuid = uuid,
+        codespace.name = codespace_name,
+        layout.path = %path.display(),
+        "Wrote Codespace Zellij layout"
+    );
     Ok(path)
 }
 
@@ -488,12 +488,17 @@ pub struct State {
 
 impl State {
     pub fn query() -> Self {
+        debug!("Querying local Zellij sessions");
         let sessions = Command::new("zellij")
             .args(["list-sessions", "-n"])
             .output()
             .ok()
             .map(|out| parse_list_sessions(&String::from_utf8_lossy(&out.stdout)))
             .unwrap_or_default();
+        debug!(
+            session.count = sessions.len(),
+            "Queried local Zellij sessions"
+        );
         Self { sessions }
     }
 
@@ -523,11 +528,16 @@ impl State {
 
 /// Kill a running zellij session.
 pub fn stop(name: &str) {
+    debug!(zellij.session = name, "Killing local Zellij session");
     let _ = Command::new("zellij").args(["kill-session", name]).output();
 }
 
 /// Delete a dead/exited zellij session.
 pub fn cleanup(name: &str) {
+    debug!(
+        zellij.session = name,
+        "Deleting exited local Zellij session"
+    );
     let _ = Command::new("zellij")
         .args(["delete-session", name])
         .output();
@@ -539,6 +549,10 @@ pub fn cleanup(name: &str) {
 /// `false` if the timeout elapsed first (zombie session).
 #[must_use = "callers should check whether cleanup actually succeeded"]
 pub fn stop_and_cleanup(name: &str) -> bool {
+    debug!(
+        zellij.session = name,
+        "Stopping and cleaning local Zellij session"
+    );
     stop(name);
     for _ in 0..50 {
         cleanup(name);
@@ -667,7 +681,6 @@ fed09876 [Created 1h ago]\n";
         assert!(layout.contains("pane command=\"nvim\""));
         assert_eq!(layout.matches("tab name=").count(), 3);
         assert!(!layout.contains("codespace ssh"));
-        assert!(!layout.contains("tmux"));
     }
 
     #[test]
@@ -683,7 +696,6 @@ fed09876 [Created 1h ago]\n";
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("go-to-tab-name ai"));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--ready)"));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--clear-ready)"));
-        assert!(!CODESPACE_LAUNCHER_SCRIPT.contains("tmux new-session"));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("$HOME/.local/bin:$mise_shims:$PATH"));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--session-id=\"$uuid\""));
         assert!(CODESPACE_LAUNCHER_SCRIPT.contains("--resume=\"$uuid\""));

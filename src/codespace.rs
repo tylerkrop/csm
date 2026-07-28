@@ -4,6 +4,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tracing::{debug, info};
 
 const MAX_DISPLAY_NAME_LEN: usize = 48;
 
@@ -21,16 +23,31 @@ pub struct RemoteState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteZellijState {
+    Connecting,
     Running,
     Exited,
     Missing,
-    LegacyTmux,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RemoteSetupOutcome {
-    Ready,
-    LegacyTmux,
+impl RemoteZellijState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Missing => "missing",
+        }
+    }
+
+    pub fn from_cached(value: &str) -> Option<Self> {
+        match value {
+            "connecting" => Some(Self::Connecting),
+            "running" => Some(Self::Running),
+            "exited" => Some(Self::Exited),
+            "missing" => Some(Self::Missing),
+            _ => None,
+        }
+    }
 }
 
 pub struct RemoteSetup<'a> {
@@ -78,9 +95,11 @@ struct GitStatus {
 }
 
 fn checked_output(command: &mut Command, action: &str) -> Result<String> {
+    debug!(action, command = ?command, "Running external command");
     let output = command
         .output()
         .with_context(|| format!("Failed to run {action}"))?;
+    debug!(action, status = %output.status, "External command completed");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
@@ -96,6 +115,7 @@ fn gh_output(args: &[&str], action: &str) -> Result<String> {
 }
 
 fn gh_status(args: &[&str], action: &str) -> Result<()> {
+    debug!(action, arguments = ?args, "Running interactive gh command");
     let status = Command::new("gh")
         .args(args)
         .stdin(Stdio::inherit())
@@ -103,6 +123,7 @@ fn gh_status(args: &[&str], action: &str) -> Result<()> {
         .stderr(Stdio::inherit())
         .status()
         .with_context(|| format!("Failed to run {action}"))?;
+    debug!(action, status = %status, "Interactive gh command completed");
     if !status.success() {
         bail!("{action} failed with {status}");
     }
@@ -370,7 +391,71 @@ pub fn create(repo: &RepoInfo, session_name: &str, uuid: &str) -> Result<String>
     }
 }
 
-pub fn prepare_remote(setup: RemoteSetup<'_>) -> Result<RemoteSetupOutcome> {
+fn file_sha256(path: &Path) -> Result<String> {
+    let contents =
+        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(contents)))
+}
+
+fn parse_remote_file_hashes(stdout: &str, expected: usize) -> Result<Vec<Option<String>>> {
+    let hashes: Vec<Option<String>> = stdout
+        .lines()
+        .map(|line| {
+            let value = line.trim();
+            if value == "missing" {
+                Ok(None)
+            } else if value.len() == 64
+                && value.chars().all(|character| character.is_ascii_hexdigit())
+            {
+                Ok(Some(value.to_ascii_lowercase()))
+            } else {
+                bail!("Unexpected remote file checksum: {value}")
+            }
+        })
+        .collect::<Result<_>>()?;
+    if hashes.len() != expected {
+        bail!(
+            "Expected {expected} remote file checksums, received {}",
+            hashes.len()
+        );
+    }
+    Ok(hashes)
+}
+
+fn remote_file_hashes(
+    name: &str,
+    github_login: &str,
+    paths: &[&str],
+) -> Result<Vec<Option<String>>> {
+    validate_name(name)?;
+    ensure_account(github_login)?;
+    let mut command = Command::new("gh");
+    command.args([
+        "codespace",
+        "ssh",
+        "--codespace",
+        name,
+        "--",
+        "sh",
+        "-c",
+        r#"for path do
+    if [ -f "$path" ]; then
+        checksum="$(sha256sum "$path")" || exit
+        printf '%s\n' "${checksum%% *}"
+    else
+        printf 'missing\n'
+    fi
+done"#,
+        "sh",
+    ]);
+    command.args(paths);
+    parse_remote_file_hashes(
+        &checked_output(&mut command, "Codespace Zellij file checksum query")?,
+        paths.len(),
+    )
+}
+
+pub fn prepare_remote(setup: RemoteSetup<'_>) -> Result<()> {
     let RemoteSetup {
         name,
         workdir,
@@ -397,8 +482,7 @@ pub fn prepare_remote(setup: RemoteSetup<'_>) -> Result<RemoteSetupOutcome> {
     let remote_launcher = remote_launcher_path(name)?;
     let remote_layout = remote_layout_path(name, uuid)?;
     let remote_config = remote_config_path(name)?;
-    eprintln!("Uploading remote Zellij files to Codespace '{name}'...");
-    for (source, destination, action) in [
+    let files = [
         (
             launcher,
             remote_launcher.as_str(),
@@ -406,7 +490,33 @@ pub fn prepare_remote(setup: RemoteSetup<'_>) -> Result<RemoteSetupOutcome> {
         ),
         (layout, remote_layout.as_str(), "Codespace layout copy"),
         (config, remote_config.as_str(), "Codespace config copy"),
-    ] {
+    ];
+    let remote_paths: Vec<&str> = files
+        .iter()
+        .map(|(_, destination, _)| *destination)
+        .collect();
+    let remote_hashes = remote_file_hashes(name, github_login, &remote_paths)?;
+    let local_hashes = files
+        .iter()
+        .map(|(source, _, _)| file_sha256(Path::new(source)))
+        .collect::<Result<Vec<_>>>()?;
+    let changed: Vec<_> = files
+        .iter()
+        .zip(local_hashes.iter().zip(remote_hashes.iter()))
+        .filter(|(_, (local, remote))| remote.as_ref() != Some(local))
+        .map(|(file, _)| file)
+        .collect();
+
+    if changed.is_empty() {
+        info!("Remote Zellij files are current");
+    } else {
+        info!(
+            codespace.name = name,
+            file.count = changed.len(),
+            "Uploading changed remote Zellij files"
+        );
+    }
+    for (source, destination, action) in changed {
         let remote_destination = format!("remote:{destination}");
         gh_output(
             &[
@@ -421,10 +531,11 @@ pub fn prepare_remote(setup: RemoteSetup<'_>) -> Result<RemoteSetupOutcome> {
             action,
         )?;
     }
-    if remote_zellij_state(name, uuid, github_login)? == RemoteZellijState::LegacyTmux {
-        return Ok(RemoteSetupOutcome::LegacyTmux);
-    }
-    eprintln!("Checking Codespace workspace and dependencies...");
+    info!(
+        codespace.name = name,
+        session.uuid = uuid,
+        "Checking Codespace workspace and dependencies"
+    );
     let resume = if resume { "true" } else { "false" };
     gh_status(
         &[
@@ -444,8 +555,8 @@ pub fn prepare_remote(setup: RemoteSetup<'_>) -> Result<RemoteSetupOutcome> {
         ],
         "Codespace preflight",
     )?;
-    eprintln!("Codespace environment is ready.");
-    Ok(RemoteSetupOutcome::Ready)
+    info!(codespace.name = name, "Codespace environment is ready");
+    Ok(())
 }
 
 fn remote_launcher_output(
@@ -476,7 +587,6 @@ fn parse_remote_zellij_state(stdout: &str) -> Result<RemoteZellijState> {
         "running" => Ok(RemoteZellijState::Running),
         "exited" => Ok(RemoteZellijState::Exited),
         "missing" => Ok(RemoteZellijState::Missing),
-        "legacy" => Ok(RemoteZellijState::LegacyTmux),
         value => bail!("Unexpected remote Zellij state: {value}"),
     }
 }
@@ -545,12 +655,27 @@ pub fn connect_zellij(
         let remote_layout = remote_layout_path(name, uuid)?;
         command.args(["--connect", uuid, workdir, &remote_layout, &remote_config]);
     }
-    command
+    debug!(
+        codespace.name = name,
+        session.uuid = uuid,
+        attach_only,
+        command = ?command,
+        "Connecting to remote Zellij"
+    );
+    let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .context("Failed to connect to remote Zellij")
+        .context("Failed to connect to remote Zellij")?;
+    debug!(
+        codespace.name = name,
+        session.uuid = uuid,
+        attach_only,
+        %status,
+        "Remote Zellij connection exited"
+    );
+    Ok(status)
 }
 
 pub fn cleanup_remote_zellij(name: &str, uuid: &str, github_login: &str) -> Result<()> {
@@ -709,11 +834,23 @@ mod tests {
             parse_remote_zellij_state("missing\n").unwrap(),
             RemoteZellijState::Missing
         );
-        assert_eq!(
-            parse_remote_zellij_state("legacy\n").unwrap(),
-            RemoteZellijState::LegacyTmux
-        );
         assert!(parse_remote_zellij_state("unknown\n").is_err());
+        assert_eq!(
+            RemoteZellijState::from_cached(RemoteZellijState::Running.as_str()),
+            Some(RemoteZellijState::Running)
+        );
+        assert_eq!(RemoteZellijState::from_cached("unknown"), None);
+    }
+
+    #[test]
+    fn parses_remote_file_checksums() {
+        let hash = "A".repeat(64);
+        assert_eq!(
+            parse_remote_file_hashes(&format!("{hash}\nmissing\n"), 2).unwrap(),
+            vec![Some("a".repeat(64)), None]
+        );
+        assert!(parse_remote_file_hashes("invalid\n", 1).is_err());
+        assert!(parse_remote_file_hashes("missing\n", 2).is_err());
     }
 
     #[test]

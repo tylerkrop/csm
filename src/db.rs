@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Schema, Statement};
+use tracing::debug;
 
 use crate::entity::session;
 
@@ -10,6 +11,7 @@ pub async fn connect() -> Result<DatabaseConnection> {
     let db_dir = home.join(".csm");
     std::fs::create_dir_all(&db_dir)?;
     let db_path = db_dir.join("sessions.db");
+    debug!(database.path = %db_path.display(), "Opening session database");
 
     let url = format!(
         "sqlite:{}?mode=rwc",
@@ -67,6 +69,10 @@ async fn ensure_session_columns(db: &DatabaseConnection) -> Result<()> {
         ("codespace_name", "TEXT"),
         ("remote_workdir", "TEXT"),
         ("github_login", "TEXT"),
+        ("cached_codespace_state", "TEXT"),
+        ("cached_codespace_branch", "TEXT"),
+        ("cached_zellij_state", "TEXT"),
+        ("codespace_state_updated_at", "TEXT"),
     ] {
         if session_columns(db).await?.contains(name) {
             continue;
@@ -118,11 +124,17 @@ mod tests {
         assert!(columns.contains("codespace_name"));
         assert!(columns.contains("remote_workdir"));
         assert!(columns.contains("github_login"));
+        assert!(columns.contains("cached_codespace_state"));
+        assert!(columns.contains("cached_codespace_branch"));
+        assert!(columns.contains("cached_zellij_state"));
+        assert!(columns.contains("codespace_state_updated_at"));
 
         let row = db
             .query_one(Statement::from_string(
                 backend,
-                "SELECT backend, codespace_name, remote_workdir, github_login
+                "SELECT backend, codespace_name, remote_workdir, github_login,
+                        cached_codespace_state, cached_codespace_branch,
+                        cached_zellij_state, codespace_state_updated_at
                  FROM sessions WHERE name = 'legacy'"
                     .to_string(),
             ))
@@ -140,6 +152,26 @@ mod tests {
         );
         assert_eq!(
             row.try_get::<Option<String>>("", "github_login").unwrap(),
+            None
+        );
+        assert_eq!(
+            row.try_get::<Option<String>>("", "cached_codespace_state")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            row.try_get::<Option<String>>("", "cached_codespace_branch")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            row.try_get::<Option<String>>("", "cached_zellij_state")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            row.try_get::<Option<String>>("", "codespace_state_updated_at")
+                .unwrap(),
             None
         );
     }
