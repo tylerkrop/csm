@@ -422,6 +422,25 @@ fn parse_remote_file_hashes(stdout: &str, expected: usize) -> Result<Vec<Option<
     Ok(hashes)
 }
 
+fn remote_file_hash_command(paths: &[&str]) -> Result<String> {
+    if paths.is_empty() {
+        bail!("No remote files supplied for checksum query");
+    }
+    for path in paths {
+        if !path.starts_with("/tmp/csm-")
+            || !path
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "/._-".contains(character))
+        {
+            bail!("Invalid remote checksum path: {path}");
+        }
+    }
+    Ok(format!(
+        r#"for path in {}; do if [ -f "$path" ]; then checksum="$(sha256sum "$path")" || exit; printf '%s\n' "${{checksum%% *}}"; else printf 'missing\n'; fi; done"#,
+        paths.join(" ")
+    ))
+}
+
 fn remote_file_hashes(
     name: &str,
     github_login: &str,
@@ -429,6 +448,7 @@ fn remote_file_hashes(
 ) -> Result<Vec<Option<String>>> {
     validate_name(name)?;
     ensure_account(github_login)?;
+    let remote_command = remote_file_hash_command(paths)?;
     let mut command = Command::new("gh");
     command.args([
         "codespace",
@@ -436,19 +456,8 @@ fn remote_file_hashes(
         "--codespace",
         name,
         "--",
-        "sh",
-        "-c",
-        r#"for path do
-    if [ -f "$path" ]; then
-        checksum="$(sha256sum "$path")" || exit
-        printf '%s\n' "${checksum%% *}"
-    else
-        printf 'missing\n'
-    fi
-done"#,
-        "sh",
+        &remote_command,
     ]);
-    command.args(paths);
     parse_remote_file_hashes(
         &checked_output(&mut command, "Codespace Zellij file checksum query")?,
         paths.len(),
@@ -851,6 +860,21 @@ mod tests {
         );
         assert!(parse_remote_file_hashes("invalid\n", 1).is_err());
         assert!(parse_remote_file_hashes("missing\n", 2).is_err());
+    }
+
+    #[test]
+    fn builds_single_remote_checksum_command() {
+        let command = remote_file_hash_command(&[
+            "/tmp/csm-space-launch-codespace.sh",
+            "/tmp/csm-space-abcdef01.kdl",
+        ])
+        .unwrap();
+        assert!(command.starts_with("for path in /tmp/csm-space-launch-codespace.sh "));
+        assert!(command.contains("sha256sum \"$path\""));
+        assert!(command.ends_with("fi; done"));
+        assert!(!command.contains("sh -c"));
+        assert!(remote_file_hash_command(&["/tmp/csm-space;rm"]).is_err());
+        assert!(remote_file_hash_command(&[]).is_err());
     }
 
     #[test]
